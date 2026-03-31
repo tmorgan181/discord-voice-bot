@@ -28,6 +28,7 @@ VOICE_RETRY_DELAY_SECONDS = 2
 VOICE_HEALTH_LOG_INTERVAL_SECONDS = 30
 DEFAULT_CLEAR_COUNT = 25
 MAX_CLEAR_COUNT = 100
+FFMPEG_SILENCE_INPUT = "anullsrc=r=48000:cl=stereo"
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SESSION_RUNTIME_LOG_PATH: Path | None = None
 SESSION_CONVERSATION_LOG_PATH: Path | None = None
@@ -286,8 +287,6 @@ async def handle_clear_command(message: discord.Message, content: str) -> None:
             channel.id,
             message.author.id,
         )
-        confirmation = await message.channel.send(f"Cleared {deleted_count} messages.")
-        await confirmation.delete(delay=5)
     except discord.Forbidden:
         logger.exception("Missing permissions while clearing messages")
         await send_error(
@@ -335,6 +334,44 @@ def voice_state_snapshot(voice_client: discord.VoiceClient | None) -> dict:
     }
 
 
+def is_idle_keepalive_active(voice_client: discord.VoiceClient | None) -> bool:
+    return bool(voice_client and getattr(voice_client, "_echo_idle_keepalive", False))
+
+
+def start_idle_keepalive(voice_client: discord.VoiceClient) -> None:
+    if not voice_client.is_connected():
+        logger.info("Skipping idle keepalive because voice client is not connected")
+        return
+    if voice_client.is_playing():
+        logger.info(
+            "Skipping idle keepalive because audio is already playing in channel %s",
+            voice_client.channel.id if voice_client.channel else None,
+        )
+        return
+
+    source = discord.FFmpegPCMAudio(
+        source=FFMPEG_SILENCE_INPUT,
+        before_options="-f lavfi",
+        options="-f s16le -ar 48000 -ac 2",
+    )
+    setattr(voice_client, "_echo_idle_keepalive", True)
+    voice_client.play(source)
+    logger.info(
+        "Started silent keepalive playback in channel %s",
+        voice_client.channel.id if voice_client.channel else None,
+    )
+
+
+def stop_idle_keepalive(voice_client: discord.VoiceClient) -> None:
+    if is_idle_keepalive_active(voice_client):
+        logger.info(
+            "Stopping silent keepalive playback in channel %s",
+            voice_client.channel.id if voice_client.channel else None,
+        )
+        setattr(voice_client, "_echo_idle_keepalive", False)
+        voice_client.stop()
+
+
 async def voice_health_monitor() -> None:
     await client.wait_until_ready()
     while not client.is_closed():
@@ -345,13 +382,14 @@ async def voice_health_monitor() -> None:
                     continue
                 snapshot = voice_state_snapshot(voice_client)
                 logger.info(
-                    "Voice health guild=%s channel=%s connected=%s playing=%s paused=%s latency=%s",
+                    "Voice health guild=%s channel=%s connected=%s playing=%s paused=%s latency=%s idle_keepalive=%s",
                     guild.id,
                     snapshot["channel_id"],
                     snapshot["connected"],
                     snapshot["playing"],
                     snapshot["paused"],
                     snapshot["latency"],
+                    is_idle_keepalive_active(voice_client),
                 )
         except Exception:
             logger.exception("Voice health monitor failed")
@@ -382,6 +420,7 @@ async def connect_voice_with_retries(
                         target_channel.name,
                         guild.id,
                     )
+                    start_idle_keepalive(voice_client)
                     return voice_client
                 await reset_voice_client(guild)
 
@@ -395,6 +434,7 @@ async def connect_voice_with_retries(
                 await voice_client.move_to(target_channel)
                 await asyncio.sleep(1)
                 if voice_client.is_connected():
+                    start_idle_keepalive(voice_client)
                     return voice_client
                 raise discord.ClientException("Voice client moved but did not become connected.")
 
@@ -411,6 +451,7 @@ async def connect_voice_with_retries(
                 self_deaf=True,
             )
             if new_voice_client.is_connected():
+                start_idle_keepalive(new_voice_client)
                 return new_voice_client
             raise discord.ClientException("Voice connection completed without a connected client.")
         except Exception as exc:
@@ -462,13 +503,19 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     def cleanup(error: Exception | None) -> None:
         if error:
             logger.exception("Voice playback error", exc_info=error)
+        setattr(voice_client, "_echo_idle_keepalive", False)
         try:
             audio_path.unlink(missing_ok=True)
         except OSError:
             logger.exception("Could not delete temporary audio file %s", audio_path)
+        if voice_client.is_connected():
+            try:
+                start_idle_keepalive(voice_client)
+            except Exception:
+                logger.exception("Failed to restart idle keepalive after TTS playback")
 
     if voice_client.is_playing():
-        voice_client.stop()
+        stop_idle_keepalive(voice_client)
 
     source = discord.FFmpegPCMAudio(str(audio_path))
     voice_client.play(source, after=cleanup)
@@ -574,6 +621,7 @@ async def on_message(message: discord.Message) -> None:
                 message.guild.id,
                 voice_state_snapshot(message.guild.voice_client),
             )
+            stop_idle_keepalive(message.guild.voice_client)
             await message.guild.voice_client.disconnect(force=True)
             logger.info("Disconnected from voice in guild %s", message.guild.id)
             await message.channel.send("Left the voice channel.")
