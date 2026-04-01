@@ -90,6 +90,10 @@ Phase 3 starter adds:
 - `BOT_REACTION_STOP_DELAY_MS`: optional delay before stopping on reaction removal, defaults to `750`
 - `BOT_AUTO_LISTEN_SILENCE_SECONDS`: optional silence threshold for hands-free utterance submission, defaults to `1.5`
 - `BOT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS`: optional max length of a single hands-free utterance before forced finalization, defaults to `30`
+- `BOT_AUTO_LISTEN_MIN_DISTINCT_WORDS`: optional minimum number of distinct 2+ character words required before a hands-free utterance is accepted, defaults to `3`
+- `BOT_AUTO_LISTEN_MIN_AUDIO_SECONDS`: optional minimum audio duration required before a hands-free chunk is considered, defaults to `0.9`
+- `BOT_AUTO_LISTEN_VOICED_WINDOW_RMS`: optional RMS threshold for a chunk window to count as voiced, defaults to `900`
+- `BOT_AUTO_LISTEN_MIN_VOICED_WINDOWS`: optional minimum number of voiced windows required before a hands-free chunk is accepted, defaults to `8`
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`

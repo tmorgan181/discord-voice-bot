@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import uuid
 import wave
 from collections import defaultdict
@@ -45,6 +46,11 @@ DEFAULT_REACTION_RECORD_SECONDS = 600
 DEFAULT_REACTION_STOP_DELAY_MS = 750
 DEFAULT_AUTO_LISTEN_SILENCE_SECONDS = 1.5
 DEFAULT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS = 30
+DEFAULT_AUTO_LISTEN_MIN_DISTINCT_WORDS = 3
+DEFAULT_AUTO_LISTEN_MIN_AUDIO_SECONDS = 0.9
+DEFAULT_AUTO_LISTEN_WINDOW_MS = 20
+DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS = 900.0
+DEFAULT_AUTO_LISTEN_MIN_VOICED_WINDOWS = 8
 DEFAULT_AUDIO_GAIN = 1.15
 DEFAULT_TARGET_RMS = 14000.0
 DEFAULT_MAX_AUDIO_GAIN = 6.0
@@ -123,6 +129,28 @@ def get_auto_listen_silence_seconds() -> float:
 
 def get_auto_listen_phrase_limit_seconds() -> int:
     return max(3, get_env_int("BOT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS", DEFAULT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS))
+
+
+def get_auto_listen_min_distinct_words() -> int:
+    return max(
+        1,
+        get_env_int(
+            "BOT_AUTO_LISTEN_MIN_DISTINCT_WORDS",
+            DEFAULT_AUTO_LISTEN_MIN_DISTINCT_WORDS,
+        ),
+    )
+
+
+def get_auto_listen_min_audio_seconds() -> float:
+    return max(0.1, get_env_float("BOT_AUTO_LISTEN_MIN_AUDIO_SECONDS", DEFAULT_AUTO_LISTEN_MIN_AUDIO_SECONDS))
+
+
+def get_auto_listen_voiced_window_rms() -> float:
+    return max(1.0, get_env_float("BOT_AUTO_LISTEN_VOICED_WINDOW_RMS", DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS))
+
+
+def get_auto_listen_min_voiced_windows() -> int:
+    return max(1, get_env_int("BOT_AUTO_LISTEN_MIN_VOICED_WINDOWS", DEFAULT_AUTO_LISTEN_MIN_VOICED_WINDOWS))
 
 
 def resolve_runtime_log_path() -> Path:
@@ -741,6 +769,63 @@ def compute_pcm_peak_abs(frames: bytes, sample_width: int) -> int:
     return max(abs(sample) for sample in samples)
 
 
+def compute_audio_duration_seconds(frame_count: int, sample_rate: int) -> float:
+    if frame_count <= 0 or sample_rate <= 0:
+        return 0.0
+    return frame_count / sample_rate
+
+
+def count_voiced_windows(
+    frames: bytes,
+    sample_width: int,
+    sample_rate: int,
+    *,
+    window_ms: int = DEFAULT_AUTO_LISTEN_WINDOW_MS,
+    rms_threshold: float = DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS,
+) -> int:
+    if not frames or sample_width != 2 or sample_rate <= 0:
+        return 0
+
+    window_frames = max(1, int(sample_rate * (window_ms / 1000)))
+    window_bytes = window_frames * sample_width
+    voiced = 0
+
+    for offset in range(0, len(frames), window_bytes):
+        chunk = frames[offset : offset + window_bytes]
+        if compute_pcm_rms(chunk, sample_width) >= rms_threshold:
+            voiced += 1
+
+    return voiced
+
+
+def should_accept_auto_audio_chunk(audio_bytes: bytes) -> tuple[bool, str, dict]:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        params = reader.getparams()
+        frames = reader.readframes(reader.getnframes())
+
+    duration_seconds = compute_audio_duration_seconds(params.nframes, params.framerate)
+    rms = compute_pcm_rms(frames, params.sampwidth)
+    voiced_windows = count_voiced_windows(
+        frames,
+        params.sampwidth,
+        params.framerate,
+        window_ms=DEFAULT_AUTO_LISTEN_WINDOW_MS,
+        rms_threshold=get_auto_listen_voiced_window_rms(),
+    )
+
+    stats = {
+        "duration_seconds": round(duration_seconds, 3),
+        "rms": round(rms, 1),
+        "voiced_windows": voiced_windows,
+    }
+
+    if duration_seconds < get_auto_listen_min_audio_seconds():
+        return False, "too_short", stats
+    if voiced_windows < get_auto_listen_min_voiced_windows():
+        return False, "not_enough_voiced_windows", stats
+    return True, "accepted", stats
+
+
 def scale_pcm_frames(frames: bytes, sample_width: int, gain: float) -> bytes:
     if not frames or gain == 1.0:
         return frames
@@ -783,6 +868,11 @@ def merge_transcript_text(existing_text: str, new_text: str) -> str:
             return f"{existing}{incoming[overlap:]}".strip()
 
     return f"{existing} {incoming}".strip()
+
+
+def extract_distinct_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return {word for word in words if len(word) >= 2}
 
 
 def amplify_wav_bytes(audio_bytes: bytes) -> tuple[bytes, float, float]:
@@ -945,6 +1035,113 @@ async def reset_voice_client(guild: discord.Guild | None) -> None:
             await guild.voice_client.disconnect(force=True)
         except Exception:
             logger.exception("Failed to disconnect stale voice client for guild %s", guild.id)
+
+
+def get_bot_voice_channel(guild: discord.Guild | None) -> discord.abc.GuildChannel | None:
+    if guild is None or client.user is None:
+        return None
+    member = guild.get_member(client.user.id)
+    if member is None or member.voice is None:
+        return None
+    return member.voice.channel
+
+
+async def fetch_bot_voice_channel(guild: discord.Guild | None) -> discord.abc.GuildChannel | None:
+    if guild is None or client.user is None:
+        return None
+
+    member = guild.get_member(client.user.id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(client.user.id)
+        except Exception:
+            logger.exception("Failed to fetch bot member state for guild %s", guild.id)
+            return None
+    else:
+        try:
+            member = await guild.fetch_member(client.user.id)
+        except Exception:
+            pass
+
+    if member.voice is None:
+        return None
+    return member.voice.channel
+
+
+async def fetch_bot_member(guild: discord.Guild | None) -> discord.Member | None:
+    if guild is None or client.user is None:
+        return None
+
+    member = guild.get_member(client.user.id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(client.user.id)
+        except Exception:
+            logger.exception("Failed to fetch bot member for guild %s", guild.id)
+            return None
+    else:
+        try:
+            member = await guild.fetch_member(client.user.id)
+        except Exception:
+            pass
+    return member
+
+
+async def force_leave_guild_voice(guild: discord.Guild, *, reason: str) -> bool:
+    voice_client = get_current_voice_client(guild)
+    bot_voice_channel = await fetch_bot_voice_channel(guild)
+    bot_member = await fetch_bot_member(guild)
+    if voice_client is None and bot_voice_channel is None:
+        return False
+
+    logger.info(
+        "Forcing bot voice disconnect guild=%s reason=%s local_client=%s bot_voice_channel=%s",
+        guild.id,
+        reason,
+        voice_state_snapshot(voice_client),
+        bot_voice_channel.id if bot_voice_channel else None,
+    )
+
+    stop_auto_listen(guild.id, disable=True)
+
+    if voice_client is not None:
+        try:
+            stop_idle_keepalive(voice_client)
+            await voice_client.disconnect(force=True)
+        except Exception:
+            logger.exception("Failed to disconnect active voice client for guild %s", guild.id)
+
+    if await fetch_bot_voice_channel(guild) is not None:
+        try:
+            await guild.change_voice_state(channel=None, self_mute=False, self_deaf=False)
+            logger.info("Issued guild.change_voice_state disconnect for guild=%s reason=%s", guild.id, reason)
+        except Exception:
+            logger.exception("Failed to clear lingering guild voice state for guild %s", guild.id)
+
+    if await fetch_bot_voice_channel(guild) is not None and bot_member is not None:
+        try:
+            await bot_member.move_to(None, reason=f"codex:{reason}")
+            logger.info("Issued member.move_to(None) disconnect for guild=%s reason=%s", guild.id, reason)
+        except Exception:
+            logger.exception("Failed to move bot member out of voice for guild %s", guild.id)
+
+    remaining_voice_channel = None
+    for _ in range(6):
+        remaining_voice_channel = await fetch_bot_voice_channel(guild)
+        if remaining_voice_channel is None:
+            break
+        await asyncio.sleep(0.5)
+
+    if remaining_voice_channel is not None:
+        logger.warning(
+            "Bot still appears connected after disconnect attempt guild=%s channel=%s reason=%s",
+            guild.id,
+            remaining_voice_channel.id,
+            reason,
+        )
+
+    clear_conversation_history(guild.id)
+    return remaining_voice_channel is None
 
 
 def voice_state_snapshot(voice_client: discord.VoiceClient | None) -> dict:
@@ -1374,6 +1571,19 @@ async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
         logger.info("Ignoring duplicate auto transcript guild=%s user=%s text=%s", guild_id, user.id, text)
         return
 
+    distinct_words = extract_distinct_words(text)
+    min_distinct_words = get_auto_listen_min_distinct_words()
+    if len(distinct_words) < min_distinct_words:
+        logger.info(
+            "Ignoring short auto transcript guild=%s user=%s distinct_words=%s min_required=%s text=%s",
+            guild_id,
+            user.id,
+            len(distinct_words),
+            min_distinct_words,
+            text,
+        )
+        return
+
     if session.get("busy"):
         logger.info("Ignoring auto transcript while another auto response is in flight guild=%s user=%s", guild_id, user.id)
         return
@@ -1430,7 +1640,18 @@ async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None)
         try:
             if user is None or (client.user and user.id == client.user.id):
                 return None
-            text, info, rms, applied_gain = transcribe_wav_bytes(audio.get_wav_data())
+            audio_data = audio.get_wav_data()
+            accepted, reason, stats = should_accept_auto_audio_chunk(audio_data)
+            if not accepted:
+                logger.info(
+                    "Rejected auto-listen audio chunk guild=%s user=%s reason=%s stats=%s",
+                    guild.id,
+                    user.id,
+                    reason,
+                    stats,
+                )
+                return None
+            text, info, rms, applied_gain = transcribe_wav_bytes(audio_data)
             logger.info(
                 "Auto-listen speech callback completed guild=%s user=%s language=%s duration=%s chars=%s rms=%s gain=%s",
                 guild.id,
@@ -1731,6 +1952,11 @@ health_monitor_task: asyncio.Task | None = None
 async def on_ready() -> None:
     global health_monitor_task
     logger.info("Logged in as %s (id=%s)", client.user, client.user.id if client.user else None)
+    for guild in client.guilds:
+        try:
+            await force_leave_guild_voice(guild, reason="startup_cleanup")
+        except Exception:
+            logger.exception("Startup voice cleanup failed for guild %s", guild.id)
     if health_monitor_task is None or health_monitor_task.done():
         health_monitor_task = asyncio.create_task(voice_health_monitor())
         logger.info("Started voice health monitor task")
@@ -1805,18 +2031,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if command == "!leave":
-        voice_client = get_current_voice_client(message.guild)
-        if message.guild and voice_client:
-            logger.info(
-                "Manual voice disconnect requested guild=%s state=%s",
-                message.guild.id,
-                voice_state_snapshot(voice_client),
-            )
-            stop_auto_listen(message.guild.id, disable=True)
-            stop_idle_keepalive(voice_client)
-            await voice_client.disconnect(force=True)
+        if message.guild and await force_leave_guild_voice(message.guild, reason="manual_leave"):
             await remove_control_message_reaction(message.channel)
-            clear_conversation_history(message.guild.id)
             logger.info("Disconnected from voice in guild %s", message.guild.id)
             await message.channel.send("Left the voice channel.")
         else:
