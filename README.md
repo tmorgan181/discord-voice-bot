@@ -2,7 +2,7 @@
 
 Phase 1 starter for a Discord bot that:
 
-- listens for `!ask <question>`
+- listens for `!say <message>`
 - sends the question to a local Ollama instance
 - replies in the text channel with the model response
 - can optionally log each exchange to JSON
@@ -12,12 +12,12 @@ Phase 2 starter adds:
 - `!join` to join your current voice channel
 - `!leave` to disconnect
 - `!clear` to bulk-delete recent channel messages
-- automatic voice playback of each `!ask` response after the text reply
+- automatic voice playback of each `!say` response after the text reply
 
 Phase 3 starter adds:
 
 - `!record [seconds]` to capture voice-channel audio and transcribe it with Whisper
-- `!talk [seconds]` to record, transcribe, ask Ollama, and speak the reply back into voice
+- `!talk [seconds]` to record, transcribe, send the transcript to Ollama, and speak the reply back into voice
 - optional reaction control on a pinned message to start on react and stop on unreact
 
 ## Quick start
@@ -60,7 +60,7 @@ Phase 3 starter adds:
 
 - `ffmpeg` must be available on your system path.
 - The bot must have permission to connect and speak in the target voice channel.
-- On `!ask`, the bot will join your current voice channel automatically if needed.
+- On `!say`, the bot will join your current voice channel automatically if needed.
 - Runtime errors and voice connection retries are written to a timestamped file in `logs/`.
 - `!record` captures speech from the current voice channel for up to 30 seconds using `SpeechRecognitionSink`.
 - The receive stack is still experimental upstream, so live voice recording may degrade or corrupt audio even on the latest published packages.
@@ -76,16 +76,21 @@ Phase 3 starter adds:
 - `OLLAMA_MODEL`: optional, defaults to `llama3.2`
 - `OLLAMA_BASE_URL`: optional, defaults to `http://127.0.0.1:11434`
 - `BOT_SYSTEM_PROMPT`: optional full system prompt template for Ollama. Supports `{bot_name}`, `{guild_name}`, `{channel_name}`, and `{user_name}`
+- `BOT_HISTORY_MAX_TURNS`: optional number of recent user/assistant turns to keep in session memory after the bot joins voice, defaults to `12`
 - `BOT_TEXT_CHANNEL_ID`: optional text channel ID for commands, transcripts, and replies
 - `BOT_VOICE_CHANNEL_ID`: optional voice channel ID for join/talk features
 - `BOT_REACTION_MESSAGE_ID`: optional message ID to use for reaction-based voice control
 - `BOT_REACTION_EMOJI`: optional control emoji for the reaction trigger, defaults to `🎙️`
 - `BOT_REACTION_RECORD_SECONDS`: optional max runtime for reaction-based recording before timeout, defaults to `600`
+- `BOT_REACTION_STOP_DELAY_MS`: optional delay before stopping on reaction removal, defaults to `750`
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`
 - `WHISPER_MODEL`: optional, defaults to `base.en`
-- `WHISPER_AUDIO_GAIN`: optional gain multiplier applied before transcription, defaults to `3.0`
+- `WHISPER_AUDIO_GAIN`: optional extra gain multiplier applied before transcription, defaults to `1.15`
+- `WHISPER_TARGET_RMS`: optional loudness target for adaptive normalization, defaults to `14000`
+- `WHISPER_MAX_GAIN`: optional hard cap for adaptive gain, defaults to `6.0`
+- `WHISPER_BEAM_SIZE`: optional Whisper decode beam size, defaults to `1`
 - `TTS_AUDIO_DIR`: optional, defaults to `generated_audio`
 - `RUNTIME_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped log file per run
 

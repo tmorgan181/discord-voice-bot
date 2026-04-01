@@ -40,7 +40,12 @@ VOICE_HEALTH_LOG_INTERVAL_SECONDS = 30
 DEFAULT_RECORD_SECONDS = 10
 MAX_RECORD_SECONDS = 30
 DEFAULT_REACTION_RECORD_SECONDS = 600
-DEFAULT_AUDIO_GAIN = 3.0
+DEFAULT_REACTION_STOP_DELAY_MS = 750
+DEFAULT_AUDIO_GAIN = 1.15
+DEFAULT_TARGET_RMS = 14000.0
+DEFAULT_MAX_AUDIO_GAIN = 6.0
+DEFAULT_WHISPER_MODEL = "base.en"
+DEFAULT_WHISPER_BEAM_SIZE = 1
 FFMPEG_SILENCE_INPUT = "anullsrc=r=48000:cl=stereo"
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SESSION_RUNTIME_LOG_PATH: Path | None = None
@@ -51,6 +56,7 @@ VOICE_RECV_PATCHED = False
 ACTIVE_RECORDING_SSRCS: set[int] = set()
 CORRUPT_PACKET_COUNTS: dict[int, int] = {}
 REACTION_RECORDING_TASKS: dict[int, asyncio.Task] = {}
+ACTIVE_CONVERSATIONS: dict[int, dict] = {}
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -75,6 +81,34 @@ def get_env_value(*names: str, default: str | None = None) -> str | None:
         if value:
             return value
     return default
+
+
+def get_history_max_turns() -> int:
+    raw_value = get_env_value("BOT_HISTORY_MAX_TURNS", default="12")
+    try:
+        return max(1, int(raw_value or "12"))
+    except ValueError:
+        return 12
+
+
+def get_env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def get_env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
 
 
 def resolve_runtime_log_path() -> Path:
@@ -215,14 +249,83 @@ def build_system_prompt(message: discord.Message) -> str | None:
         return template
 
 
+def reset_conversation_history(guild_id: int, channel_id: int | None) -> None:
+    ACTIVE_CONVERSATIONS[guild_id] = {
+        "channel_id": channel_id,
+        "turns": [],
+    }
+    logger.info(
+        "Reset conversation history for guild=%s channel=%s",
+        guild_id,
+        channel_id,
+    )
+
+
+def clear_conversation_history(guild_id: int) -> None:
+    if ACTIVE_CONVERSATIONS.pop(guild_id, None) is not None:
+        logger.info("Cleared conversation history for guild=%s", guild_id)
+
+
+def get_active_conversation_channel_id(guild: discord.Guild | None) -> int | None:
+    voice_client = get_current_voice_client(guild)
+    if voice_client and voice_client.channel:
+        return voice_client.channel.id
+    return None
+
+
+def get_conversation_history_text(message: discord.Message) -> str:
+    if not message.guild:
+        return ""
+
+    session = ACTIVE_CONVERSATIONS.get(message.guild.id)
+    if not session:
+        return ""
+    if session.get("channel_id") != get_active_conversation_channel_id(message.guild):
+        return ""
+
+    turns = session.get("turns", [])
+    if not turns:
+        return ""
+
+    history_lines = ["Conversation so far in this voice session:"]
+    for turn in turns[-get_history_max_turns():]:
+        history_lines.append(f"{turn['role']}: {turn['content']}")
+    return "\n".join(history_lines)
+
+
+def add_conversation_turn(guild_id: int | None, channel_id: int | None, role: str, content: str) -> None:
+    if guild_id is None or channel_id is None or not content.strip():
+        return
+
+    session = ACTIVE_CONVERSATIONS.get(guild_id)
+    if session is None or session.get("channel_id") != channel_id:
+        reset_conversation_history(guild_id, channel_id)
+        session = ACTIVE_CONVERSATIONS[guild_id]
+
+    session["turns"].append(
+        {
+            "role": role,
+            "content": content.strip(),
+        }
+    )
+    max_turns = get_history_max_turns() * 2
+    if len(session["turns"]) > max_turns:
+        session["turns"] = session["turns"][-max_turns:]
+
+
 def ask_ollama_with_context(message: discord.Message, prompt: str) -> str:
     base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_URL).rstrip("/")
     model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
     system_prompt = build_system_prompt(message)
 
+    full_prompt = prompt
+    history_text = get_conversation_history_text(message)
+    if history_text:
+        full_prompt = f"{history_text}\n\nCurrent user message:\n{prompt}"
+
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": full_prompt,
         "stream": False,
     }
     if system_prompt:
@@ -237,6 +340,10 @@ def ask_ollama_with_context(message: discord.Message, prompt: str) -> str:
 
     data = response.json()
     return data.get("response", "").strip()
+
+
+def get_ollama_display_target() -> str:
+    return os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_URL).rstrip("/")
 
 
 def append_conversation_log(entry: dict) -> None:
@@ -309,15 +416,72 @@ async def respond_with_ollama(
     speak_reply: bool = True,
     log_source: str = "text",
 ) -> str | None:
+    add_conversation_turn(
+        message.guild.id if message.guild else None,
+        get_active_conversation_channel_id(message.guild),
+        "user",
+        prompt,
+    )
+
     async with message.channel.typing():
         try:
             answer = await asyncio.to_thread(ask_ollama_with_context, message, prompt)
             logger.info("Ollama answered successfully for user %s source=%s", message.author.id, log_source)
-        except requests.RequestException:
-            logger.exception("Ollama request failed")
+        except requests.ConnectionError as exc:
+            ollama_target = get_ollama_display_target()
+            logger.warning(
+                "Ollama connection failed target=%s user=%s source=%s error=%s",
+                ollama_target,
+                message.author.id,
+                log_source,
+                exc,
+            )
             await send_error(
                 message.channel,
-                "I couldn't reach Ollama. Make sure it is running locally, then try again.",
+                f"I couldn't reach Ollama at `{ollama_target}`. Make sure `ollama serve` is running, then try again.",
+            )
+            return None
+        except requests.Timeout as exc:
+            ollama_target = get_ollama_display_target()
+            logger.warning(
+                "Ollama request timed out target=%s user=%s source=%s error=%s",
+                ollama_target,
+                message.author.id,
+                log_source,
+                exc,
+            )
+            await send_error(
+                message.channel,
+                f"Ollama at `{ollama_target}` took too long to respond. Try again in a moment.",
+            )
+            return None
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            ollama_target = get_ollama_display_target()
+            logger.warning(
+                "Ollama returned HTTP error target=%s status=%s user=%s source=%s",
+                ollama_target,
+                status_code,
+                message.author.id,
+                log_source,
+            )
+            await send_error(
+                message.channel,
+                f"Ollama returned an HTTP error (`{status_code}`) from `{ollama_target}`.",
+            )
+            return None
+        except requests.RequestException as exc:
+            ollama_target = get_ollama_display_target()
+            logger.warning(
+                "Ollama request failed target=%s user=%s source=%s error=%s",
+                ollama_target,
+                message.author.id,
+                log_source,
+                exc,
+            )
+            await send_error(
+                message.channel,
+                f"Ollama request failed at `{ollama_target}`. Check the bot log for details.",
             )
             return None
         except Exception:
@@ -328,6 +492,12 @@ async def respond_with_ollama(
             )
             return None
 
+    add_conversation_turn(
+        message.guild.id if message.guild else None,
+        get_active_conversation_channel_id(message.guild),
+        "assistant",
+        answer,
+    )
     log_conversation_exchange(message, prompt, answer, source=log_source)
 
     reply_text = f"{send_prefix}{answer}" if send_prefix else answer
@@ -361,6 +531,7 @@ async def handle_record_or_talk(
     duration_seconds: int,
     *,
     mode: str,
+    status_message: str | None = None,
 ) -> None:
     try:
         voice_client = await ensure_voice_client(context)
@@ -380,8 +551,11 @@ async def handle_record_or_talk(
                 "A recording is already in progress. Use `!stop` first if you want to end it early.",
             )
             return
-        status_text = "Recording and listening" if mode == "talk" else "Recording"
-        await context.channel.send(f"{status_text} for {duration_seconds} seconds...")
+        status_text = status_message
+        if status_text is None:
+            base_status = "Recording and listening" if mode == "talk" else "Recording"
+            status_text = f"{base_status} for {duration_seconds} seconds..."
+        await context.channel.send(status_text)
         async with context.channel.typing():
             transcript = await run_speech_recognition_capture(
                 voice_client,
@@ -503,6 +677,20 @@ def compute_pcm_rms(frames: bytes, sample_width: int) -> float:
     return math.sqrt(square_sum / len(samples))
 
 
+def compute_pcm_peak_abs(frames: bytes, sample_width: int) -> int:
+    if not frames:
+        return 0
+    if sample_width != 2:
+        return 0
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if not samples:
+        return 0
+
+    return max(abs(sample) for sample in samples)
+
+
 def scale_pcm_frames(frames: bytes, sample_width: int, gain: float) -> bytes:
     if not frames or gain == 1.0:
         return frames
@@ -521,26 +709,65 @@ def scale_pcm_frames(frames: bytes, sample_width: int, gain: float) -> bytes:
     return samples.tobytes()
 
 
-def amplify_wav_bytes(audio_bytes: bytes) -> tuple[bytes, float]:
+def merge_transcript_text(existing_text: str, new_text: str) -> str:
+    existing = existing_text.strip()
+    incoming = new_text.strip()
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+
+    existing_lower = existing.lower()
+    incoming_lower = incoming.lower()
+
+    if incoming_lower == existing_lower:
+        return existing
+    if incoming_lower in existing_lower:
+        return existing
+    if existing_lower.endswith(incoming_lower):
+        return existing
+
+    max_overlap = min(len(existing), len(incoming))
+    for overlap in range(max_overlap, 0, -1):
+        if existing_lower[-overlap:] == incoming_lower[:overlap]:
+            return f"{existing}{incoming[overlap:]}".strip()
+
+    return f"{existing} {incoming}".strip()
+
+
+def amplify_wav_bytes(audio_bytes: bytes) -> tuple[bytes, float, float]:
     with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
         params = reader.getparams()
         frames = reader.readframes(reader.getnframes())
 
     rms = compute_pcm_rms(frames, params.sampwidth)
-    gain = float(os.getenv("WHISPER_AUDIO_GAIN", str(DEFAULT_AUDIO_GAIN)))
-    boosted_frames = scale_pcm_frames(frames, params.sampwidth, gain)
+    peak = compute_pcm_peak_abs(frames, params.sampwidth)
+    manual_gain = get_env_float("WHISPER_AUDIO_GAIN", DEFAULT_AUDIO_GAIN)
+    target_rms = get_env_float("WHISPER_TARGET_RMS", DEFAULT_TARGET_RMS)
+    max_gain = max(1.0, get_env_float("WHISPER_MAX_GAIN", DEFAULT_MAX_AUDIO_GAIN))
+
+    adaptive_gain = 1.0
+    if rms > 0 and target_rms > 0:
+        adaptive_gain = max(1.0, target_rms / rms)
+
+    headroom_gain = max_gain
+    if peak > 0:
+        headroom_gain = 32767 / peak
+
+    applied_gain = min(max_gain, adaptive_gain * manual_gain, headroom_gain)
+    boosted_frames = scale_pcm_frames(frames, params.sampwidth, applied_gain)
 
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as writer:
         writer.setparams(params)
         writer.writeframes(boosted_frames)
-    return buffer.getvalue(), float(rms)
+    return buffer.getvalue(), float(rms), float(applied_gain)
 
 
 def get_whisper_model() -> WhisperModel:
     global WHISPER_MODEL_INSTANCE
     if WHISPER_MODEL_INSTANCE is None:
-        model_name = os.getenv("WHISPER_MODEL", "tiny.en")
+        model_name = os.getenv("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
         device = os.getenv("WHISPER_DEVICE", "cpu")
         compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
         logger.info(
@@ -621,6 +848,7 @@ async def handle_clear_command(message: discord.Message, content: str) -> None:
             check=lambda msg: not msg.pinned,
         )
         deleted_count = max(len(deleted) - 1, 0)
+        clear_conversation_history(message.guild.id)
         logger.info(
             "Cleared %s messages in channel %s requested by user %s limit=%s",
             deleted_count,
@@ -811,6 +1039,8 @@ async def connect_voice_with_retries(
                             target_channel.name,
                             guild.id,
                         )
+                        if guild.id not in ACTIVE_CONVERSATIONS:
+                            reset_conversation_history(guild.id, target_channel.id)
                         start_idle_keepalive(voice_client)
                         return voice_client
                 if get_current_voice_client(guild):
@@ -830,6 +1060,8 @@ async def connect_voice_with_retries(
                         target_channel.name,
                         guild.id,
                     )
+                    if guild.id not in ACTIVE_CONVERSATIONS:
+                        reset_conversation_history(guild.id, target_channel.id)
                     start_idle_keepalive(voice_client)
                     return voice_client
 
@@ -843,6 +1075,7 @@ async def connect_voice_with_retries(
                 await voice_client.move_to(target_channel)
                 await asyncio.sleep(1)
                 if voice_client.is_connected():
+                    reset_conversation_history(guild.id, target_channel.id)
                     start_idle_keepalive(voice_client)
                     return voice_client
                 raise discord.ClientException("Voice client moved but did not become connected.")
@@ -862,6 +1095,7 @@ async def connect_voice_with_retries(
                 cls=voice_recv.VoiceRecvClient,
             )
             if new_voice_client.is_connected():
+                reset_conversation_history(guild.id, target_channel.id)
                 start_idle_keepalive(new_voice_client)
                 return new_voice_client
             raise discord.ClientException("Voice connection completed without a connected client.")
@@ -1041,7 +1275,7 @@ async def run_speech_recognition_capture(
 
     finished = asyncio.get_running_loop().create_future()
     stop_event = asyncio.Event()
-    transcript_parts: list[str] = []
+    transcript_text = ""
     recognition_errors: list[str] = []
     recording_path = create_recording_path(target_user)
     recording_params: wave._wave_params | None = None
@@ -1073,22 +1307,23 @@ async def run_speech_recognition_capture(
             audio_data = audio.get_wav_data()
             nonlocal recording_params
             recording_params, _ = append_wav_frames(audio_data, recording_pcm_chunks)
-            boosted_audio_data, rms = amplify_wav_bytes(audio_data)
+            boosted_audio_data, rms, applied_gain = amplify_wav_bytes(audio_data)
             model = get_whisper_model()
             segments, info = model.transcribe(
                 io.BytesIO(boosted_audio_data),
-                beam_size=1,
+                beam_size=max(1, get_env_int("WHISPER_BEAM_SIZE", DEFAULT_WHISPER_BEAM_SIZE)),
                 vad_filter=False,
             )
             text = " ".join(segment.text.strip() for segment in segments).strip()
             logger.info(
-                "Speech recognition process callback completed user=%s target_user_id=%s language=%s duration=%s chars=%s rms=%s",
+                "Speech recognition process callback completed user=%s target_user_id=%s language=%s duration=%s chars=%s rms=%s gain=%s",
                 user,
                 target_user.id,
                 getattr(info, "language", None),
                 getattr(info, "duration", None),
                 len(text),
                 rms,
+                round(applied_gain, 3),
             )
             return text or None
         except Exception as exc:
@@ -1098,6 +1333,7 @@ async def run_speech_recognition_capture(
             return None
 
     def text_cb(user, text):
+        nonlocal transcript_text
         if user is None or user.id != target_user.id:
             logger.info(
                 "Ignoring speech text for non-target user=%s target_user_id=%s text=%s",
@@ -1106,14 +1342,22 @@ async def run_speech_recognition_capture(
                 text,
             )
             return
-        logger.info(
-            "SpeechRecognitionSink text user=%s target_user_id=%s text=%s",
-            user,
+            logger.info(
+                "SpeechRecognitionSink text user=%s target_user_id=%s text=%s",
+                user,
             target_user.id,
             text,
         )
         if text and text.strip():
-            transcript_parts.append(text.strip())
+            prior_text = transcript_text
+            transcript_text = merge_transcript_text(transcript_text, text.strip())
+            logger.info(
+                "Merged speech transcript target_user_id=%s prior_chars=%s new_chars=%s merged_chars=%s",
+                target_user.id,
+                len(prior_text),
+                len(text.strip()),
+                len(transcript_text),
+            )
 
     sink = SpeechRecognitionSink(
         process_cb=process_cb,
@@ -1177,7 +1421,7 @@ async def run_speech_recognition_capture(
             )
         if callback_error and not is_recoverable_capture_error(callback_error):
             raise RuntimeError(f"Speech recognition capture ended with an error: {callback_error}")
-        if recognition_errors and not transcript_parts:
+        if recognition_errors and not transcript_text:
             raise RuntimeError(f"Speech recognizer failed: {recognition_errors[-1]}")
 
     if save_recording_wav(recording_path, recording_params, recording_pcm_chunks):
@@ -1191,7 +1435,7 @@ async def run_speech_recognition_capture(
     else:
         logger.warning("No recording audio was saved for target_user_id=%s", target_user.id)
 
-    transcript = " ".join(transcript_parts).strip()
+    transcript = transcript_text.strip()
     logger.info("Speech recognition capture produced chars=%s", len(transcript))
     return transcript
 
@@ -1212,6 +1456,10 @@ if reaction_control_message_id:
 reaction_control_emoji = get_env_value("BOT_REACTION_EMOJI", default="🎙️")
 reaction_record_seconds = int(
     get_env_value("BOT_REACTION_RECORD_SECONDS", default=str(DEFAULT_REACTION_RECORD_SECONDS))
+)
+reaction_stop_delay_ms = max(
+    0,
+    get_env_int("BOT_REACTION_STOP_DELAY_MS", DEFAULT_REACTION_STOP_DELAY_MS),
 )
 conversation_logging_enabled = env_flag("ENABLE_CONVERSATION_LOGGING")
 
@@ -1262,6 +1510,8 @@ async def on_voice_state_update(
         after.self_mute,
         after.self_deaf,
     )
+    if after.channel is None:
+        clear_conversation_history(member.guild.id)
 
 
 @client.event
@@ -1309,6 +1559,7 @@ async def on_message(message: discord.Message) -> None:
             stop_idle_keepalive(voice_client)
             await voice_client.disconnect(force=True)
             await remove_control_message_reaction(message.channel)
+            clear_conversation_history(message.guild.id)
             logger.info("Disconnected from voice in guild %s", message.guild.id)
             await message.channel.send("Left the voice channel.")
         else:
@@ -1369,12 +1620,12 @@ async def on_message(message: discord.Message) -> None:
             await send_error(message.channel, "There is no active recording or playback to stop.")
         return
 
-    if command != "!ask":
+    if command != "!say":
         return
 
     question = content[4:].strip()
     if not question:
-        await message.channel.send("Usage: `!ask your question here`")
+        await message.channel.send("Usage: `!say your message here`")
         return
 
     await respond_with_ollama(
@@ -1425,7 +1676,12 @@ async def fetch_reaction_context(payload: discord.RawReactionActionEvent):
 
 async def run_reaction_voice_loop(context, duration_seconds: int) -> None:
     try:
-        await handle_record_or_talk(context, duration_seconds, mode="talk")
+        await handle_record_or_talk(
+            context,
+            duration_seconds,
+            mode="talk",
+            status_message="Recording and listening...",
+        )
     finally:
         if context.guild:
             REACTION_RECORDING_TASKS.pop(context.guild.id, None)
@@ -1499,11 +1755,14 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
         return
 
     logger.info(
-        "Stopping reaction-controlled recording guild=%s user=%s emoji=%s",
+        "Stopping reaction-controlled recording guild=%s user=%s emoji=%s stop_delay_ms=%s",
         payload.guild_id,
         payload.user_id,
         payload.emoji,
+        reaction_stop_delay_ms,
     )
+    if reaction_stop_delay_ms > 0:
+        await asyncio.sleep(reaction_stop_delay_ms / 1000)
     stop_active_recording(payload.guild_id)
 
 
