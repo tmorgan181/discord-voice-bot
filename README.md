@@ -17,6 +17,7 @@ Phase 2 starter adds:
 Phase 3 starter adds:
 
 - `!record [seconds]` to capture voice-channel audio and transcribe it with Whisper
+- `!talk [seconds]` to record, transcribe, ask Ollama, and speak the reply back into voice
 
 ## Quick start
 

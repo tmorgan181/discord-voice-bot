@@ -36,8 +36,6 @@ DEFAULT_RUNTIME_LOG_DIR = Path("logs")
 VOICE_CONNECT_RETRIES = 3
 VOICE_RETRY_DELAY_SECONDS = 2
 VOICE_HEALTH_LOG_INTERVAL_SECONDS = 30
-DEFAULT_CLEAR_COUNT = 25
-MAX_CLEAR_COUNT = 100
 DEFAULT_RECORD_SECONDS = 10
 MAX_RECORD_SECONDS = 30
 DEFAULT_AUDIO_GAIN = 3.0
@@ -261,6 +259,92 @@ def append_conversation_log(entry: dict) -> None:
         logger.exception("Could not write conversation log at %s", log_path)
 
 
+def log_conversation_exchange(
+    message: discord.Message,
+    prompt: str,
+    response: str,
+    source: str = "text",
+) -> None:
+    if not conversation_logging_enabled:
+        return
+
+    append_conversation_log(
+        {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "guild_id": message.guild.id if message.guild else None,
+            "guild_name": message.guild.name if message.guild else None,
+            "channel_id": message.channel.id,
+            "channel_name": getattr(message.channel, "name", None),
+            "user_id": message.author.id,
+            "username": str(message.author),
+            "display_name": (
+                message.author.display_name
+                if isinstance(message.author, discord.Member)
+                else str(message.author)
+            ),
+            "prompt": prompt,
+            "response": response,
+            "model": os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
+            "source": source,
+        }
+    )
+
+
+async def respond_with_ollama(
+    message: discord.Message,
+    prompt: str,
+    *,
+    send_prefix: str | None = None,
+    speak_reply: bool = True,
+    log_source: str = "text",
+) -> str | None:
+    async with message.channel.typing():
+        try:
+            answer = await asyncio.to_thread(ask_ollama_with_context, message, prompt)
+            logger.info("Ollama answered successfully for user %s source=%s", message.author.id, log_source)
+        except requests.RequestException:
+            logger.exception("Ollama request failed")
+            await send_error(
+                message.channel,
+                "I couldn't reach Ollama. Make sure it is running locally, then try again.",
+            )
+            return None
+        except Exception:
+            logger.exception("Unexpected Ollama error")
+            await send_error(
+                message.channel,
+                "Something went wrong while asking Ollama.",
+            )
+            return None
+
+    log_conversation_exchange(message, prompt, answer, source=log_source)
+
+    reply_text = f"{send_prefix}{answer}" if send_prefix else answer
+    await message.channel.send(reply_text)
+
+    if not speak_reply:
+        return answer
+
+    try:
+        voice_client = await ensure_voice_client(message)
+        if voice_client is not None:
+            await speak_text(voice_client, answer)
+    except discord.ClientException:
+        logger.exception("Discord voice error after text reply")
+        await send_error(
+            message.channel,
+            "I answered in text, but I couldn't connect to voice. Check my voice permissions and try `!join` again.",
+        )
+    except Exception:
+        logger.exception("TTS or playback error after text reply")
+        await send_error(
+            message.channel,
+            "I answered in text, but voice playback failed.",
+        )
+
+    return answer
+
+
 def synthesize_tts_to_file(text: str) -> Path:
     audio_dir = Path(os.getenv("TTS_AUDIO_DIR", DEFAULT_AUDIO_DIR))
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -421,29 +505,31 @@ async def handle_clear_command(message: discord.Message, content: str) -> None:
         return
 
     parts = content.split(maxsplit=1)
-    count = DEFAULT_CLEAR_COUNT
+    count: int | None = None
     if len(parts) == 2:
         try:
             count = int(parts[1])
         except ValueError:
-            await send_error(message.channel, "Usage: `!clear` or `!clear 25`")
+            await send_error(message.channel, "Usage: `!clear` or `!clear 50`")
             return
 
-    if count < 1 or count > MAX_CLEAR_COUNT:
-        await send_error(
-            message.channel,
-            f"`!clear` accepts a number between 1 and {MAX_CLEAR_COUNT}.",
-        )
-        return
+        if count < 1:
+            await send_error(
+                message.channel,
+                "`!clear` only accepts a positive number.",
+            )
+            return
 
     try:
-        deleted = await channel.purge(limit=count + 1, bulk=True)
+        purge_limit = None if count is None else count + 1
+        deleted = await channel.purge(limit=purge_limit, bulk=True)
         deleted_count = max(len(deleted) - 1, 0)
         logger.info(
-            "Cleared %s messages in channel %s requested by user %s",
+            "Cleared %s messages in channel %s requested by user %s limit=%s",
             deleted_count,
             channel.id,
             message.author.id,
+            count,
         )
     except discord.Forbidden:
         logger.exception("Missing permissions while clearing messages")
@@ -1024,7 +1110,7 @@ async def on_message(message: discord.Message) -> None:
         await handle_clear_command(message, content)
         return
 
-    if command == "!record":
+    if command in {"!record", "!talk"}:
         duration_seconds = DEFAULT_RECORD_SECONDS
         if len(parts) == 2:
             try:
@@ -1032,14 +1118,14 @@ async def on_message(message: discord.Message) -> None:
             except ValueError:
                 await send_error(
                     message.channel,
-                    f"Usage: `!record` or `!record {DEFAULT_RECORD_SECONDS}`",
+                    f"Usage: `{command}` or `{command} {DEFAULT_RECORD_SECONDS}`",
                 )
                 return
 
         if duration_seconds < 1 or duration_seconds > MAX_RECORD_SECONDS:
             await send_error(
                 message.channel,
-                f"`!record` accepts a number between 1 and {MAX_RECORD_SECONDS} seconds.",
+                f"`{command}` accepts a number between 1 and {MAX_RECORD_SECONDS} seconds.",
             )
             return
 
@@ -1060,7 +1146,8 @@ async def on_message(message: discord.Message) -> None:
                     "A recording is already in progress. Use `!stop` first if you want to end it early.",
                 )
                 return
-            await message.channel.send(f"Recording for {duration_seconds} seconds...")
+            status_text = "Recording and listening" if command == "!talk" else "Recording"
+            await message.channel.send(f"{status_text} for {duration_seconds} seconds...")
             async with message.channel.typing():
                 transcript = await run_speech_recognition_capture(
                     voice_client,
@@ -1099,7 +1186,22 @@ async def on_message(message: discord.Message) -> None:
                 len(transcript),
             )
 
-        await message.channel.send(f"Transcript: {transcript}")
+        if command == "!record":
+            await message.channel.send(f"Transcript: {transcript}")
+            return
+
+        if transcript == "[No speech detected]":
+            await message.channel.send(f"Transcript: {transcript}")
+            return
+
+        await message.channel.send(f"Heard: {transcript}")
+        await respond_with_ollama(
+            message,
+            transcript,
+            send_prefix="Echo: ",
+            speak_reply=True,
+            log_source="voice",
+        )
         return
 
     if command == "!stop":
@@ -1133,61 +1235,12 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send("Usage: `!ask your question here`")
         return
 
-    async with message.channel.typing():
-        try:
-            answer = await asyncio.to_thread(ask_ollama_with_context, message, question)
-            logger.info("Ollama answered successfully for user %s", message.author.id)
-        except requests.RequestException:
-            logger.exception("Ollama request failed")
-            await send_error(
-                message.channel,
-                "I couldn't reach Ollama. Make sure it is running locally, then try again.",
-            )
-            return
-        except Exception:
-            logger.exception("Unexpected error while generating a reply")
-            await send_error(message.channel, "Something went wrong while generating a reply.")
-            return
-
-    if not answer:
-        answer = "Ollama returned an empty response."
-
-    if conversation_logging_enabled:
-        append_conversation_log(
-            {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "guild_id": message.guild.id if message.guild else None,
-                "guild_name": message.guild.name if message.guild else None,
-                "channel_id": message.channel.id,
-                "channel_name": getattr(message.channel, "name", None),
-                "user_id": message.author.id,
-                "username": str(message.author),
-                "prompt": question,
-                "response": answer,
-                "model": os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
-            }
-        )
-
-    for start in range(0, len(answer), MAX_DISCORD_MESSAGE_LEN):
-        chunk = answer[start : start + MAX_DISCORD_MESSAGE_LEN]
-        await message.channel.send(chunk)
-
-    try:
-        voice_client = await ensure_voice_client(message)
-        if voice_client is not None:
-            await speak_text(voice_client, answer)
-    except discord.ClientException:
-        logger.exception("Discord voice error after text reply")
-        await send_error(
-            message.channel,
-            "I answered in text, but I couldn't connect to voice. Check my voice permissions and try `!join` again.",
-        )
-    except Exception:
-        logger.exception("TTS or playback error after text reply")
-        await send_error(
-            message.channel,
-            "I answered in text, but speaking the reply failed. Check the runtime log for details.",
-        )
+    await respond_with_ollama(
+        message,
+        question,
+        speak_reply=True,
+        log_source="text",
+    )
 
 
 if __name__ == "__main__":
