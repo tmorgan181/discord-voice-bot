@@ -13,11 +13,13 @@ Phase 2 starter adds:
 - `!leave` to disconnect
 - `!clear` to bulk-delete recent channel messages
 - automatic voice playback of each `!say` response after the text reply
+- hands-free listening with `!talk`, with utterances finalized after silence
 
 Phase 3 starter adds:
 
 - `!record [seconds]` to capture voice-channel audio and transcribe it with Whisper
-- `!talk [seconds]` to record, transcribe, send the transcript to Ollama, and speak the reply back into voice
+- `!talk` to start hands-free listening in voice until you stop it
+- `!talk [seconds]` to do a single timed voice turn, then stop
 - optional reaction control on a pinned message to start on react and stop on unreact
 
 ## Quick start
@@ -61,6 +63,9 @@ Phase 3 starter adds:
 - `ffmpeg` must be available on your system path.
 - The bot must have permission to connect and speak in the target voice channel.
 - On `!say`, the bot will join your current voice channel automatically if needed.
+- `!join` only joins voice.
+- `!talk` starts hands-free listening, and Echo will submit an utterance after roughly 1.5 seconds of silence.
+- `!stop` stops either a timed recording or the hands-free listener.
 - Runtime errors and voice connection retries are written to a timestamped file in `logs/`.
 - `!record` captures speech from the current voice channel for up to 30 seconds using `SpeechRecognitionSink`.
 - The receive stack is still experimental upstream, so live voice recording may degrade or corrupt audio even on the latest published packages.
@@ -83,6 +88,8 @@ Phase 3 starter adds:
 - `BOT_REACTION_EMOJI`: optional control emoji for the reaction trigger, defaults to `🎙️`
 - `BOT_REACTION_RECORD_SECONDS`: optional max runtime for reaction-based recording before timeout, defaults to `600`
 - `BOT_REACTION_STOP_DELAY_MS`: optional delay before stopping on reaction removal, defaults to `750`
+- `BOT_AUTO_LISTEN_SILENCE_SECONDS`: optional silence threshold for hands-free utterance submission, defaults to `1.5`
+- `BOT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS`: optional max length of a single hands-free utterance before forced finalization, defaults to `30`
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`

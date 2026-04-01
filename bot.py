@@ -7,6 +7,7 @@ import math
 import os
 import uuid
 import wave
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from faster_whisper import WhisperModel
 from discord.ext import voice_recv
 from discord.ext.voice_recv import opus as voice_recv_opus
 from discord.ext.voice_recv.extras.speechrecognition import SpeechRecognitionSink
+import speech_recognition as sr
 
 try:
     import davey  # type: ignore
@@ -41,6 +43,8 @@ DEFAULT_RECORD_SECONDS = 10
 MAX_RECORD_SECONDS = 30
 DEFAULT_REACTION_RECORD_SECONDS = 600
 DEFAULT_REACTION_STOP_DELAY_MS = 750
+DEFAULT_AUTO_LISTEN_SILENCE_SECONDS = 1.5
+DEFAULT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS = 30
 DEFAULT_AUDIO_GAIN = 1.15
 DEFAULT_TARGET_RMS = 14000.0
 DEFAULT_MAX_AUDIO_GAIN = 6.0
@@ -57,6 +61,8 @@ ACTIVE_RECORDING_SSRCS: set[int] = set()
 CORRUPT_PACKET_COUNTS: dict[int, int] = {}
 REACTION_RECORDING_TASKS: dict[int, asyncio.Task] = {}
 ACTIVE_CONVERSATIONS: dict[int, dict] = {}
+AUTO_LISTEN_SESSIONS: dict[int, dict] = {}
+AUTO_LISTEN_ENABLED_GUILDS: set[int] = set()
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -109,6 +115,14 @@ def get_env_int(name: str, default: int) -> int:
         return int(raw_value)
     except ValueError:
         return default
+
+
+def get_auto_listen_silence_seconds() -> float:
+    return max(0.5, get_env_float("BOT_AUTO_LISTEN_SILENCE_SECONDS", DEFAULT_AUTO_LISTEN_SILENCE_SECONDS))
+
+
+def get_auto_listen_phrase_limit_seconds() -> int:
+    return max(3, get_env_int("BOT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS", DEFAULT_AUTO_LISTEN_PHRASE_LIMIT_SECONDS))
 
 
 def resolve_runtime_log_path() -> Path:
@@ -344,6 +358,39 @@ def ask_ollama_with_context(message: discord.Message, prompt: str) -> str:
 
 def get_ollama_display_target() -> str:
     return os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+class TunedSpeechRecognitionSink(SpeechRecognitionSink):
+    def __init__(
+        self,
+        *,
+        process_cb=None,
+        text_cb=None,
+        default_recognizer: str = "whisper",
+        phrase_time_limit: int = 10,
+        ignore_silence_packets: bool = True,
+        pause_threshold: float = DEFAULT_AUTO_LISTEN_SILENCE_SECONDS,
+    ) -> None:
+        super().__init__(
+            process_cb=process_cb,
+            text_cb=text_cb,
+            default_recognizer=default_recognizer,
+            phrase_time_limit=phrase_time_limit,
+            ignore_silence_packets=ignore_silence_packets,
+        )
+        self._pause_threshold = pause_threshold
+        self._stream_data = defaultdict(self._make_stream_data)
+
+    def _make_stream_data(self):
+        recognizer = sr.Recognizer()
+        recognizer.pause_threshold = self._pause_threshold
+        recognizer.non_speaking_duration = min(self._pause_threshold, 0.5)
+        recognizer.dynamic_energy_threshold = True
+        return {
+            "stopper": None,
+            "recognizer": recognizer,
+            "buffer": array.array("B"),
+        }
 
 
 def append_conversation_log(entry: dict) -> None:
@@ -596,10 +643,12 @@ async def handle_record_or_talk(
 
     if mode == "record":
         await context.channel.send(f"Transcript: {transcript}")
+        await ensure_auto_listen(context.guild, context.channel)
         return
 
     if transcript == "[No speech detected]":
         await context.channel.send(f"Transcript: {transcript}")
+        await ensure_auto_listen(context.guild, context.channel)
         return
 
     await context.channel.send(f"Heard: {transcript}")
@@ -610,6 +659,7 @@ async def handle_record_or_talk(
         speak_reply=True,
         log_source="voice",
     )
+    await ensure_auto_listen(context.guild, context.channel)
 
 
 def synthesize_tts_to_file(text: str) -> Path:
@@ -782,6 +832,18 @@ def get_whisper_model() -> WhisperModel:
             compute_type=compute_type,
         )
     return WHISPER_MODEL_INSTANCE
+
+
+def transcribe_wav_bytes(audio_data: bytes) -> tuple[str, object, float, float]:
+    boosted_audio_data, rms, applied_gain = amplify_wav_bytes(audio_data)
+    model = get_whisper_model()
+    segments, info = model.transcribe(
+        io.BytesIO(boosted_audio_data),
+        beam_size=max(1, get_env_int("WHISPER_BEAM_SIZE", DEFAULT_WHISPER_BEAM_SIZE)),
+        vad_filter=False,
+    )
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    return text, info, rms, applied_gain
 
 
 async def send_error(channel: discord.abc.Messageable, text: str) -> None:
@@ -1152,6 +1214,8 @@ async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvC
 
 
 async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
+    guild = getattr(voice_client, "guild", None)
+    guild_id = guild.id if guild else None
     logger.info(
         "Preparing TTS playback channel=%s chars=%s state=%s",
         voice_client.channel.id if voice_client.channel else None,
@@ -1173,7 +1237,17 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
                 start_idle_keepalive(voice_client)
             except Exception:
                 logger.exception("Failed to restart idle keepalive after TTS playback")
+            if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        ensure_auto_listen(guild),
+                        client.loop,
+                    )
+                except Exception:
+                    logger.exception("Failed to resume auto-listen after TTS playback")
 
+    if guild_id is not None:
+        stop_auto_listen(guild_id)
     if voice_client.is_playing():
         stop_idle_keepalive(voice_client)
 
@@ -1257,6 +1331,188 @@ async def remove_control_message_reaction(channel: discord.abc.Messageable) -> N
         logger.exception("Failed to remove control reaction")
 
 
+async def resolve_text_channel_for_guild(
+    guild: discord.Guild, fallback_channel: discord.abc.Messageable | None = None
+):
+    if text_channel_id:
+        channel = client.get_channel(text_channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(text_channel_id)
+            except Exception:
+                logger.exception("Could not fetch configured text channel text_channel_id=%s", text_channel_id)
+                channel = None
+        if channel is not None:
+            return channel
+    return fallback_channel
+
+
+def stop_auto_listen(guild_id: int, *, disable: bool = False) -> bool:
+    if disable:
+        AUTO_LISTEN_ENABLED_GUILDS.discard(guild_id)
+    session = AUTO_LISTEN_SESSIONS.pop(guild_id, None)
+    if not session:
+        return False
+
+    voice_client = session.get("voice_client")
+    if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
+        logger.info("Stopping auto-listen for guild=%s", guild_id)
+        voice_client.stop_listening()
+    return True
+
+
+async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
+    session = AUTO_LISTEN_SESSIONS.get(guild_id)
+    if not session or not text.strip():
+        return
+
+    if client.user and user.id == client.user.id:
+        return
+
+    last_text = session.get("last_text", "")
+    if text.strip().lower() == str(last_text).strip().lower():
+        logger.info("Ignoring duplicate auto transcript guild=%s user=%s text=%s", guild_id, user.id, text)
+        return
+
+    if session.get("busy"):
+        logger.info("Ignoring auto transcript while another auto response is in flight guild=%s user=%s", guild_id, user.id)
+        return
+
+    channel = await resolve_text_channel_for_guild(session["guild"], session.get("text_channel"))
+    if channel is None:
+        logger.warning("Auto-listen could not resolve a text channel for guild=%s", guild_id)
+        return
+
+    session["busy"] = True
+    session["last_text"] = text.strip()
+    try:
+        await channel.send(f"Heard {getattr(user, 'display_name', user)}: {text.strip()}")
+        message_like = SimpleNamespace(guild=session["guild"], channel=channel, author=user)
+        await respond_with_ollama(
+            message_like,
+            text.strip(),
+            speak_reply=True,
+            log_source="auto",
+        )
+    finally:
+        session["busy"] = False
+
+
+async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None) -> None:
+    if guild is None:
+        return
+    if guild.id not in AUTO_LISTEN_ENABLED_GUILDS:
+        return
+    if guild.id in ACTIVE_RECORDINGS:
+        return
+
+    voice_client = get_current_voice_client(guild)
+    if not isinstance(voice_client, voice_recv.VoiceRecvClient) or not voice_client.is_connected():
+        return
+
+    existing = AUTO_LISTEN_SESSIONS.get(guild.id)
+    if existing and existing.get("voice_client") is voice_client and voice_client.is_listening():
+        if fallback_channel is not None:
+            existing["text_channel"] = fallback_channel
+        return
+
+    stop_auto_listen(guild.id)
+    text_channel = await resolve_text_channel_for_guild(guild, fallback_channel)
+    pause_threshold = get_auto_listen_silence_seconds()
+    phrase_limit = get_auto_listen_phrase_limit_seconds()
+
+    def process_cb(recognizer, audio, user):
+        try:
+            if user is None or (client.user and user.id == client.user.id):
+                return None
+            text, info, rms, applied_gain = transcribe_wav_bytes(audio.get_wav_data())
+            logger.info(
+                "Auto-listen speech callback completed guild=%s user=%s language=%s duration=%s chars=%s rms=%s gain=%s",
+                guild.id,
+                user.id,
+                getattr(info, "language", None),
+                getattr(info, "duration", None),
+                len(text),
+                rms,
+                round(applied_gain, 3),
+            )
+            return text or None
+        except Exception:
+            logger.exception("Auto-listen speech callback failed guild=%s user=%s", guild.id, getattr(user, "id", None))
+            return None
+
+    def text_cb(user, text):
+        if user is None or not text or not text.strip():
+            return
+        logger.info("Auto-listen text guild=%s user=%s text=%s", guild.id, user.id, text)
+        asyncio.run_coroutine_threadsafe(handle_auto_transcript(guild.id, user, text), client.loop)
+
+    sink = TunedSpeechRecognitionSink(
+        process_cb=process_cb,
+        text_cb=text_cb,
+        default_recognizer="whisper",
+        phrase_time_limit=phrase_limit,
+        ignore_silence_packets=True,
+        pause_threshold=pause_threshold,
+    )
+
+    AUTO_LISTEN_SESSIONS[guild.id] = {
+        "voice_client": voice_client,
+        "guild": guild,
+        "text_channel": text_channel,
+        "busy": False,
+        "last_text": "",
+    }
+
+    def after_auto_listen(exc: Exception | None) -> None:
+        try:
+            sink.cleanup()
+        except Exception:
+            logger.exception("Failed cleaning up auto-listen sink guild=%s", guild.id)
+        if exc:
+            logger.exception("Auto-listen callback reported an error guild=%s", guild.id, exc_info=exc)
+        current = AUTO_LISTEN_SESSIONS.get(guild.id)
+        if current and current.get("voice_client") is voice_client and guild.id not in ACTIVE_RECORDINGS:
+            AUTO_LISTEN_SESSIONS.pop(guild.id, None)
+
+    voice_client.listen(sink, after=after_auto_listen)
+    logger.info(
+        "Started auto-listen guild=%s voice_channel=%s pause_threshold=%s phrase_limit=%s text_channel=%s",
+        guild.id,
+        voice_client.channel.id if voice_client.channel else None,
+        pause_threshold,
+        phrase_limit,
+        getattr(text_channel, "id", None),
+    )
+
+
+async def enable_hands_free_mode(context) -> bool:
+    if not context.guild:
+        await send_error(context.channel, "Hands-free mode only works inside a server.")
+        return False
+
+    AUTO_LISTEN_ENABLED_GUILDS.add(context.guild.id)
+
+    try:
+        voice_client = await ensure_voice_client(context)
+    except discord.ClientException:
+        logger.exception("Discord voice join failed while enabling hands-free mode")
+        await send_error(
+            context.channel,
+            "I couldn't join the voice channel after several retries. Check my Connect/Speak permissions and try again.",
+        )
+        return False
+
+    if voice_client is None:
+        return False
+
+    await ensure_auto_listen(context.guild, context.channel)
+    await context.channel.send(
+        f"Hands-free mode is live in `{voice_client.channel.name}`. I'll listen, respond, talk, then listen again."
+    )
+    return True
+
+
 async def run_speech_recognition_capture(
     voice_client: voice_recv.VoiceRecvClient,
     duration_seconds: int,
@@ -1270,6 +1526,7 @@ async def run_speech_recognition_capture(
         target_user,
     )
 
+    stop_auto_listen(guild_id)
     stop_idle_keepalive(voice_client)
     stop_voice_capture(voice_client)
 
@@ -1307,14 +1564,7 @@ async def run_speech_recognition_capture(
             audio_data = audio.get_wav_data()
             nonlocal recording_params
             recording_params, _ = append_wav_frames(audio_data, recording_pcm_chunks)
-            boosted_audio_data, rms, applied_gain = amplify_wav_bytes(audio_data)
-            model = get_whisper_model()
-            segments, info = model.transcribe(
-                io.BytesIO(boosted_audio_data),
-                beam_size=max(1, get_env_int("WHISPER_BEAM_SIZE", DEFAULT_WHISPER_BEAM_SIZE)),
-                vad_filter=False,
-            )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            text, info, rms, applied_gain = transcribe_wav_bytes(audio_data)
             logger.info(
                 "Speech recognition process callback completed user=%s target_user_id=%s language=%s duration=%s chars=%s rms=%s gain=%s",
                 user,
@@ -1511,6 +1761,7 @@ async def on_voice_state_update(
         after.self_deaf,
     )
     if after.channel is None:
+        stop_auto_listen(member.guild.id, disable=True)
         clear_conversation_history(member.guild.id)
 
 
@@ -1556,6 +1807,7 @@ async def on_message(message: discord.Message) -> None:
                 message.guild.id,
                 voice_state_snapshot(voice_client),
             )
+            stop_auto_listen(message.guild.id, disable=True)
             stop_idle_keepalive(voice_client)
             await voice_client.disconnect(force=True)
             await remove_control_message_reaction(message.channel)
@@ -1568,6 +1820,10 @@ async def on_message(message: discord.Message) -> None:
 
     if command == "!clear":
         await handle_clear_command(message, content)
+        return
+
+    if command == "!talk" and len(parts) == 1:
+        await enable_hands_free_mode(message)
         return
 
     if command in {"!record", "!talk"}:
@@ -1602,6 +1858,9 @@ async def on_message(message: discord.Message) -> None:
         if message.guild and stop_active_recording(message.guild.id):
             stopped_anything = True
 
+        if message.guild and stop_auto_listen(message.guild.id, disable=True):
+            stopped_anything = True
+
         voice_client = get_current_voice_client(message.guild)
         if voice_client and voice_client.is_playing():
             logger.info(
@@ -1617,7 +1876,7 @@ async def on_message(message: discord.Message) -> None:
             stopped_anything = True
 
         if not stopped_anything:
-            await send_error(message.channel, "There is no active recording or playback to stop.")
+            await send_error(message.channel, "There is no active talk session, recording, or playback to stop.")
         return
 
     if command != "!say":
