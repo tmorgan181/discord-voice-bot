@@ -12,6 +12,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import discord
 from discord.opus import OpusError
@@ -53,6 +54,12 @@ DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS = 900.0
 DEFAULT_AUTO_LISTEN_MIN_VOICED_WINDOWS = 8
 DEFAULT_AUTO_LISTEN_MIN_VOICED_RATIO = 0.2
 DEFAULT_AUTO_LISTEN_MAX_ZERO_CROSSING_RATE = 0.3
+DEFAULT_AUTO_LISTEN_MAX_LAUGH_TOKEN_RATIO = 0.6
+DEFAULT_AUTO_LISTEN_MIN_NON_LAUGH_WORDS = 2
+DEFAULT_INTERRUPT_MIN_AUDIO_SECONDS = 0.12
+DEFAULT_INTERRUPT_MIN_VOICED_WINDOWS = 2
+DEFAULT_INTERRUPT_MIN_VOICED_RATIO = 0.05
+DEFAULT_INTERRUPT_MIN_RMS = 120.0
 DEFAULT_AUDIO_GAIN = 1.15
 DEFAULT_TARGET_RMS = 14000.0
 DEFAULT_MAX_AUDIO_GAIN = 6.0
@@ -71,6 +78,7 @@ REACTION_RECORDING_TASKS: dict[int, asyncio.Task] = {}
 ACTIVE_CONVERSATIONS: dict[int, dict] = {}
 AUTO_LISTEN_SESSIONS: dict[int, dict] = {}
 AUTO_LISTEN_ENABLED_GUILDS: set[int] = set()
+ACTIVE_TTS_PLAYBACKS: dict[int, dict] = {}
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -166,6 +174,20 @@ def get_auto_listen_max_zero_crossing_rate() -> float:
     )
 
 
+def get_auto_listen_max_laugh_token_ratio() -> float:
+    return max(
+        0.0,
+        min(1.0, get_env_float("BOT_AUTO_LISTEN_MAX_LAUGH_TOKEN_RATIO", DEFAULT_AUTO_LISTEN_MAX_LAUGH_TOKEN_RATIO)),
+    )
+
+
+def get_auto_listen_min_non_laugh_words() -> int:
+    return max(
+        0,
+        get_env_int("BOT_AUTO_LISTEN_MIN_NON_LAUGH_WORDS", DEFAULT_AUTO_LISTEN_MIN_NON_LAUGH_WORDS),
+    )
+
+
 def resolve_runtime_log_path() -> Path:
     configured = os.getenv("RUNTIME_LOG_PATH", "").strip()
     if configured:
@@ -212,7 +234,7 @@ def setup_logging() -> logging.Logger:
 
     discord.utils.setup_logging(level=logging.INFO, root=False)
 
-    logger = logging.getLogger("echo")
+    logger = logging.getLogger("chung")
     logger.info("Runtime logging initialized at %s", log_path)
     return logger
 
@@ -753,6 +775,22 @@ def save_recording_wav(path: Path, params: wave._wave_params | None, pcm_chunks:
     return True
 
 
+def build_wav_bytes_from_pcm(
+    frames: bytes,
+    *,
+    channels: int = 2,
+    sample_width: int = 2,
+    sample_rate: int = 48000,
+) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(sample_width)
+        writer.setframerate(sample_rate)
+        writer.writeframes(frames)
+    return buffer.getvalue()
+
+
 def compute_pcm_rms(frames: bytes, sample_width: int) -> float:
     if not frames:
         return 0.0
@@ -900,6 +938,84 @@ def should_accept_auto_audio_chunk(audio_bytes: bytes) -> tuple[bool, str, dict]
     return True, "accepted", stats
 
 
+def should_accept_interrupt_audio_chunk(audio_bytes: bytes) -> tuple[bool, str, dict]:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        params = reader.getparams()
+        frames = reader.readframes(reader.getnframes())
+
+    duration_seconds = compute_audio_duration_seconds(params.nframes, params.framerate)
+    rms = compute_pcm_rms(frames, params.sampwidth)
+    voiced_windows, total_windows, average_voiced_zcr = analyze_voiced_windows(
+        frames,
+        params.sampwidth,
+        params.framerate,
+        window_ms=DEFAULT_AUTO_LISTEN_WINDOW_MS,
+        rms_threshold=get_auto_listen_voiced_window_rms(),
+    )
+    voiced_ratio = (voiced_windows / total_windows) if total_windows else 0.0
+
+    stats = {
+        "duration_seconds": round(duration_seconds, 3),
+        "rms": round(rms, 1),
+        "voiced_windows": voiced_windows,
+        "voiced_ratio": round(voiced_ratio, 3),
+        "avg_voiced_zcr": round(average_voiced_zcr, 3),
+    }
+
+    if duration_seconds < DEFAULT_INTERRUPT_MIN_AUDIO_SECONDS:
+        return False, "too_short", stats
+    if voiced_windows < DEFAULT_INTERRUPT_MIN_VOICED_WINDOWS:
+        return False, "not_enough_voiced_windows", stats
+    if voiced_ratio < DEFAULT_INTERRUPT_MIN_VOICED_RATIO:
+        return False, "not_enough_voiced_ratio", stats
+    if average_voiced_zcr > get_auto_listen_max_zero_crossing_rate():
+        return False, "too_noisy", stats
+    return True, "accepted", stats
+
+
+def should_accept_interrupt_pcm_chunk(
+    frames: bytes,
+    *,
+    sample_width: int = 2,
+    sample_rate: int = 48000,
+    channels: int = 2,
+) -> tuple[bool, str, dict]:
+    if not frames:
+        return False, "empty", {"duration_seconds": 0.0, "rms": 0.0, "voiced_windows": 0, "voiced_ratio": 0.0, "avg_voiced_zcr": 0.0}
+
+    frame_count = len(frames) // max(1, sample_width * channels)
+    duration_seconds = compute_audio_duration_seconds(frame_count, sample_rate)
+    rms = compute_pcm_rms(frames, sample_width)
+    voiced_windows, total_windows, average_voiced_zcr = analyze_voiced_windows(
+        frames,
+        sample_width,
+        sample_rate,
+        window_ms=DEFAULT_AUTO_LISTEN_WINDOW_MS,
+        rms_threshold=get_auto_listen_voiced_window_rms(),
+    )
+    voiced_ratio = (voiced_windows / total_windows) if total_windows else 0.0
+
+    stats = {
+        "duration_seconds": round(duration_seconds, 3),
+        "rms": round(rms, 1),
+        "voiced_windows": voiced_windows,
+        "voiced_ratio": round(voiced_ratio, 3),
+        "avg_voiced_zcr": round(average_voiced_zcr, 3),
+    }
+
+    if rms < DEFAULT_INTERRUPT_MIN_RMS:
+        return False, "too_quiet", stats
+    if duration_seconds < DEFAULT_INTERRUPT_MIN_AUDIO_SECONDS:
+        return False, "too_short", stats
+    if voiced_windows < DEFAULT_INTERRUPT_MIN_VOICED_WINDOWS:
+        return False, "not_enough_voiced_windows", stats
+    if voiced_ratio < DEFAULT_INTERRUPT_MIN_VOICED_RATIO:
+        return False, "not_enough_voiced_ratio", stats
+    if average_voiced_zcr > get_auto_listen_max_zero_crossing_rate():
+        return False, "too_noisy", stats
+    return True, "accepted", stats
+
+
 def scale_pcm_frames(frames: bytes, sample_width: int, gain: float) -> bytes:
     if not frames or gain == 1.0:
         return frames
@@ -947,6 +1063,51 @@ def merge_transcript_text(existing_text: str, new_text: str) -> str:
 def extract_distinct_words(text: str) -> set[str]:
     words = re.findall(r"[a-z0-9']+", text.lower())
     return {word for word in words if len(word) >= 2}
+
+
+def normalize_word_token(token: str) -> str:
+    return re.sub(r"(.)\1{2,}", r"\1\1", token.lower())
+
+
+def is_laughter_token(token: str) -> bool:
+    normalized = normalize_word_token(token)
+    if normalized in {"lol", "lmao", "lmfao", "rofl", "haha", "hehe", "hihi", "hoho", "hahae"}:
+        return True
+    if re.fullmatch(r"(ha|he|hi|ho|hu){2,}", normalized):
+        return True
+    return False
+
+
+def analyze_transcript_tokens(text: str) -> dict:
+    tokens = [token for token in re.findall(r"[a-z0-9']+", text.lower()) if len(token) >= 2]
+    laugh_tokens = [token for token in tokens if is_laughter_token(token)]
+    non_laugh_tokens = [token for token in tokens if not is_laughter_token(token)]
+    laugh_ratio = (len(laugh_tokens) / len(tokens)) if tokens else 0.0
+    return {
+        "tokens": tokens,
+        "laugh_tokens": laugh_tokens,
+        "non_laugh_tokens": non_laugh_tokens,
+        "laugh_ratio": laugh_ratio,
+        "distinct_non_laugh_words": len(set(non_laugh_tokens)),
+    }
+
+
+def should_ignore_laughter_transcript(text: str) -> tuple[bool, dict]:
+    stats = analyze_transcript_tokens(text)
+    laugh_ratio = stats["laugh_ratio"]
+    distinct_non_laugh_words = stats["distinct_non_laugh_words"]
+    max_laugh_ratio = get_auto_listen_max_laugh_token_ratio()
+    min_non_laugh_words = get_auto_listen_min_non_laugh_words()
+
+    ignored = (
+        bool(stats["tokens"])
+        and laugh_ratio >= max_laugh_ratio
+        and distinct_non_laugh_words < min_non_laugh_words
+    )
+    stats["laugh_ratio"] = round(laugh_ratio, 3)
+    stats["max_laugh_ratio"] = max_laugh_ratio
+    stats["min_non_laugh_words"] = min_non_laugh_words
+    return ignored, stats
 
 
 def amplify_wav_bytes(audio_bytes: bytes) -> tuple[bytes, float, float]:
@@ -1284,7 +1445,10 @@ def stop_idle_keepalive(voice_client: discord.VoiceClient) -> None:
             voice_client.channel.id if voice_client.channel else None,
         )
         setattr(voice_client, "_idle_keepalive_active", False)
-        voice_client.stop()
+        if hasattr(voice_client, "stop_playing"):
+            voice_client.stop_playing()
+        else:
+            voice_client.stop()
 
 
 def stop_voice_capture(voice_client: discord.VoiceClient) -> None:
@@ -1485,6 +1649,44 @@ async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvC
     return voice_client
 
 
+def request_tts_interrupt(guild_id: int, *, user_id: int | None = None, stats: dict | None = None) -> bool:
+    playback = ACTIVE_TTS_PLAYBACKS.get(guild_id)
+    if not playback:
+        return False
+
+    if playback.get("interrupt_requested"):
+        return True
+
+    voice_client = playback.get("voice_client")
+    if not isinstance(voice_client, discord.VoiceClient):
+        return False
+
+    playback["interrupt_requested"] = True
+    logger.info(
+        "Interrupt requested guild=%s user=%s stats=%s playing=%s",
+        guild_id,
+        user_id,
+        stats,
+        voice_client.is_playing(),
+    )
+
+    def stop_playback_now() -> None:
+        current = ACTIVE_TTS_PLAYBACKS.get(guild_id)
+        if not current:
+            return
+        current["interrupt_requested"] = True
+        vc = current.get("voice_client")
+        if isinstance(vc, discord.VoiceClient) and vc.is_playing():
+            logger.info("Stopping active TTS playback for interrupt guild=%s", guild_id)
+            if hasattr(vc, "stop_playing"):
+                vc.stop_playing()
+            else:
+                vc.stop()
+
+    client.loop.call_soon_threadsafe(stop_playback_now)
+    return True
+
+
 async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     guild = getattr(voice_client, "guild", None)
     guild_id = guild.id if guild else None
@@ -1495,8 +1697,14 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
         voice_state_snapshot(voice_client),
     )
     audio_path = await asyncio.to_thread(synthesize_tts_to_file, text)
+    if guild_id is not None:
+        ACTIVE_TTS_PLAYBACKS[guild_id] = {
+            "voice_client": voice_client,
+            "interrupt_requested": False,
+        }
 
     def cleanup(error: Exception | None) -> None:
+        playback_state = ACTIVE_TTS_PLAYBACKS.pop(guild_id, None) if guild_id is not None else None
         if error:
             logger.exception("Voice playback error", exc_info=error)
         setattr(voice_client, "_idle_keepalive_active", False)
@@ -1504,22 +1712,44 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
             audio_path.unlink(missing_ok=True)
         except OSError:
             logger.exception("Could not delete temporary audio file %s", audio_path)
+        interrupted = bool(playback_state and playback_state.get("interrupt_requested"))
+        fallback_channel = None
+        if guild is not None:
+            session = AUTO_LISTEN_SESSIONS.get(guild.id)
+            fallback_channel = session.get("text_channel") if session else None
+            if session and session.get("interrupt_only"):
+                if not session.get("capture_active"):
+                    stop_auto_listen(guild.id)
+                else:
+                    logger.info("Keeping interrupt-listen active after playback stop guild=%s for capture finalization", guild.id)
         if voice_client.is_connected():
-            try:
-                start_idle_keepalive(voice_client)
-            except Exception:
-                logger.exception("Failed to restart idle keepalive after TTS playback")
             if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        ensure_auto_listen(guild),
-                        client.loop,
-                    )
+                    if interrupted and session and session.get("capture_active"):
+                        pass
+                    elif interrupted:
+                        asyncio.run_coroutine_threadsafe(
+                            resume_hands_free_after_playback(guild, fallback_channel),
+                            client.loop,
+                        )
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            resume_hands_free_after_playback(guild, fallback_channel),
+                            client.loop,
+                        )
                 except Exception:
                     logger.exception("Failed to resume auto-listen after TTS playback")
+            else:
+                try:
+                    start_idle_keepalive(voice_client)
+                except Exception:
+                    logger.exception("Failed to restart idle keepalive after TTS playback")
 
     if guild_id is not None:
         stop_auto_listen(guild_id)
+        if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
+            logger.info("Attempting to start interrupt-listen for guild=%s before TTS playback", guild.id)
+            await ensure_interrupt_listen(guild)
     if voice_client.is_playing():
         stop_idle_keepalive(voice_client)
 
@@ -1634,6 +1864,11 @@ def stop_auto_listen(guild_id: int, *, disable: bool = False) -> bool:
     if not session:
         return False
 
+    for handle_key in ("finalize_handle",):
+        handle = session.get(handle_key)
+        if handle is not None:
+            handle.cancel()
+
     voice_client = session.get("voice_client")
     if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
         logger.info("Stopping auto-listen for guild=%s", guild_id)
@@ -1641,17 +1876,46 @@ def stop_auto_listen(guild_id: int, *, disable: bool = False) -> bool:
     return True
 
 
+async def wait_for_voice_listener_stop(
+    voice_client: voice_recv.VoiceRecvClient,
+    *,
+    timeout_seconds: float = 1.0,
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while voice_client.is_listening() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+    return not voice_client.is_listening()
+
+
 async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
     session = AUTO_LISTEN_SESSIONS.get(guild_id)
     if not session or not text.strip():
         return
+    await process_auto_transcript(session["guild"], user, text, session.get("text_channel"))
 
-    if client.user and user.id == client.user.id:
+
+async def process_auto_transcript(
+    guild: discord.Guild,
+    user,
+    text: str,
+    fallback_channel=None,
+) -> None:
+    async def resume_if_needed() -> None:
+        await resume_hands_free_if_enabled(guild, fallback_channel)
+
+    if not text.strip():
+        await resume_if_needed()
         return
 
-    last_text = session.get("last_text", "")
+    if client.user and user.id == client.user.id:
+        await resume_if_needed()
+        return
+
+    session = AUTO_LISTEN_SESSIONS.get(guild.id)
+    last_text = session.get("last_text", "") if session else ""
     if text.strip().lower() == str(last_text).strip().lower():
-        logger.info("Ignoring duplicate auto transcript guild=%s user=%s text=%s", guild_id, user.id, text)
+        logger.info("Ignoring duplicate auto transcript guild=%s user=%s text=%s", guild.id, user.id, text)
+        await resume_if_needed()
         return
 
     distinct_words = extract_distinct_words(text)
@@ -1659,28 +1923,42 @@ async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
     if len(distinct_words) < min_distinct_words:
         logger.info(
             "Ignoring short auto transcript guild=%s user=%s distinct_words=%s min_required=%s text=%s",
-            guild_id,
+            guild.id,
             user.id,
             len(distinct_words),
             min_distinct_words,
             text,
         )
+        await resume_if_needed()
         return
 
-    if session.get("busy"):
-        logger.info("Ignoring auto transcript while another auto response is in flight guild=%s user=%s", guild_id, user.id)
+    ignore_laughter, laughter_stats = should_ignore_laughter_transcript(text)
+    if ignore_laughter:
+        logger.info(
+            "Ignoring laughter-like auto transcript guild=%s user=%s stats=%s text=%s",
+            guild.id,
+            user.id,
+            laughter_stats,
+            text,
+        )
+        await resume_if_needed()
         return
 
-    guild = session["guild"]
-    fallback_channel = session.get("text_channel")
+    if session and session.get("busy"):
+        logger.info("Ignoring auto transcript while another auto response is in flight guild=%s user=%s", guild.id, user.id)
+        await resume_if_needed()
+        return
+
     channel = await resolve_text_channel_for_guild(guild, fallback_channel)
     if channel is None:
-        logger.warning("Auto-listen could not resolve a text channel for guild=%s", guild_id)
+        logger.warning("Auto-listen could not resolve a text channel for guild=%s", guild.id)
+        await resume_if_needed()
         return
 
-    session["busy"] = True
-    session["last_text"] = text.strip()
-    stop_auto_listen(guild_id)
+    if session is not None:
+        session["busy"] = True
+        session["last_text"] = text.strip()
+    stop_auto_listen(guild.id)
     try:
         await channel.send(f"Heard {getattr(user, 'display_name', user)}: {text.strip()}")
         message_like = SimpleNamespace(guild=guild, channel=channel, author=user)
@@ -1691,52 +1969,299 @@ async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
             log_source="auto",
         )
     finally:
-        current = AUTO_LISTEN_SESSIONS.get(guild_id)
+        current = AUTO_LISTEN_SESSIONS.get(guild.id)
         if current is not None:
             current["busy"] = False
 
 
 async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None) -> None:
-    if guild is None:
-        return
+    await ensure_speech_listener(guild, fallback_channel, interrupt_only=False)
+
+
+async def ensure_interrupt_listen(guild: discord.Guild | None, fallback_channel=None) -> None:
+    await ensure_speech_listener(guild, fallback_channel, interrupt_only=True)
+
+
+async def resume_auto_listen_after_interrupt(guild: discord.Guild, fallback_channel=None) -> None:
+    await asyncio.sleep(0.15)
+    await ensure_auto_listen(guild, fallback_channel)
+
+
+async def resume_hands_free_after_playback(guild: discord.Guild, fallback_channel=None) -> None:
+    await asyncio.sleep(0.15)
+    stop_auto_listen(guild.id)
+    await asyncio.sleep(0.05)
+    await ensure_auto_listen(guild, fallback_channel)
+    voice_client = get_current_voice_client(guild)
+    if voice_client and voice_client.is_connected() and not voice_client.is_playing():
+        try:
+            start_idle_keepalive(voice_client)
+        except Exception:
+            logger.exception("Failed to restart idle keepalive after resuming hands-free mode")
+
+
+async def resume_hands_free_if_enabled(guild: discord.Guild, fallback_channel=None) -> None:
     if guild.id not in AUTO_LISTEN_ENABLED_GUILDS:
         return
+    await resume_hands_free_after_playback(guild, fallback_channel)
+
+
+async def finalize_interrupt_capture(guild_id: int) -> None:
+    session = AUTO_LISTEN_SESSIONS.get(guild_id)
+    if not session or not session.get("interrupt_only") or not session.get("capture_active"):
+        return
+
+    guild = session["guild"]
+    user = session.get("interrupt_user")
+    pcm_chunks = session.get("capture_pcm_chunks") or []
+    fallback_channel = session.get("text_channel")
+    session["capture_active"] = False
+    session["finalize_handle"] = None
+
+    if user is None or not pcm_chunks:
+        stop_auto_listen(guild_id)
+        await ensure_auto_listen(guild, fallback_channel)
+        return
+
+    wav_bytes = build_wav_bytes_from_pcm(b"".join(pcm_chunks))
+    stop_auto_listen(guild_id)
+
+    try:
+        text, info, rms, applied_gain = await asyncio.to_thread(transcribe_wav_bytes, wav_bytes)
+        logger.info(
+            "Interrupt capture transcription completed guild=%s user=%s language=%s duration=%s chars=%s rms=%s gain=%s",
+            guild_id,
+            getattr(user, "id", None),
+            getattr(info, "language", None),
+            getattr(info, "duration", None),
+            len(text),
+            rms,
+            round(applied_gain, 3),
+        )
+    except Exception:
+        logger.exception("Interrupt capture transcription failed guild=%s user=%s", guild_id, getattr(user, "id", None))
+        await ensure_auto_listen(guild, fallback_channel)
+        return
+
+    if not text.strip():
+        logger.info("Interrupt capture produced no text guild=%s user=%s", guild_id, getattr(user, "id", None))
+        await ensure_auto_listen(guild, fallback_channel)
+        return
+
+    await process_auto_transcript(guild, user, text, fallback_channel)
+
+
+def schedule_interrupt_finalize(guild_id: int) -> None:
+    def _schedule() -> None:
+        session = AUTO_LISTEN_SESSIONS.get(guild_id)
+        if not session or not session.get("interrupt_only"):
+            return
+        handle = session.get("finalize_handle")
+        if handle is not None:
+            handle.cancel()
+        session["finalize_handle"] = client.loop.call_later(
+            get_auto_listen_silence_seconds(),
+            lambda: asyncio.create_task(finalize_interrupt_capture(guild_id)),
+        )
+
+    client.loop.call_soon_threadsafe(_schedule)
+
+
+async def ensure_speech_listener(
+    guild: discord.Guild | None,
+    fallback_channel=None,
+    *,
+    interrupt_only: bool,
+) -> None:
+    if guild is None:
+        logger.info("Skipping %s because guild is None", "interrupt-listen" if interrupt_only else "auto-listen")
+        return
+    if guild.id not in AUTO_LISTEN_ENABLED_GUILDS:
+        logger.info(
+            "Skipping %s for guild=%s because hands-free mode is disabled",
+            "interrupt-listen" if interrupt_only else "auto-listen",
+            guild.id,
+        )
+        return
     if guild.id in ACTIVE_RECORDINGS:
+        logger.info(
+            "Skipping %s for guild=%s because an active recording is running",
+            "interrupt-listen" if interrupt_only else "auto-listen",
+            guild.id,
+        )
         return
 
     voice_client = get_current_voice_client(guild)
     if not isinstance(voice_client, voice_recv.VoiceRecvClient) or not voice_client.is_connected():
+        logger.info(
+            "Skipping %s for guild=%s because no connected voice recv client is available",
+            "interrupt-listen" if interrupt_only else "auto-listen",
+            guild.id,
+        )
         return
 
     existing = AUTO_LISTEN_SESSIONS.get(guild.id)
-    if existing and existing.get("voice_client") is voice_client and voice_client.is_listening():
+    if (
+        existing
+        and existing.get("voice_client") is voice_client
+        and existing.get("interrupt_only") == interrupt_only
+        and voice_client.is_listening()
+    ):
         if fallback_channel is not None:
             existing["text_channel"] = fallback_channel
         return
 
     stop_auto_listen(guild.id)
+    if voice_client.is_listening():
+        stopped = await wait_for_voice_listener_stop(voice_client)
+        logger.info(
+            "Waited for prior listener shutdown guild=%s mode=%s stopped=%s",
+            guild.id,
+            "interrupt" if interrupt_only else "auto",
+            stopped,
+        )
+        if not stopped:
+            return
     text_channel = await resolve_text_channel_for_guild(guild, fallback_channel)
-    pause_threshold = get_auto_listen_silence_seconds()
-    phrase_limit = get_auto_listen_phrase_limit_seconds()
+
+    if interrupt_only:
+        rolling_pcm = bytearray()
+        rolling_window_seconds = 0.2
+        max_pcm_bytes = int(48000 * 2 * 2 * rolling_window_seconds)
+        last_accept_monotonic = 0.0
+        last_debug_monotonic = 0.0
+
+        def interrupt_cb(user, data):
+            nonlocal last_accept_monotonic, last_debug_monotonic
+            try:
+                if user is None or (client.user and user.id == client.user.id):
+                    return
+                current = AUTO_LISTEN_SESSIONS.get(guild.id)
+                pcm = getattr(data, "pcm", b"") or b""
+                if not pcm:
+                    return
+                if not current or not current.get("interrupt_only"):
+                    return
+                if current.get("capture_active"):
+                    interrupt_user = current.get("interrupt_user")
+                    if interrupt_user is None or interrupt_user.id != user.id:
+                        return
+                    current["capture_pcm_chunks"].append(pcm)
+                    schedule_interrupt_finalize(guild.id)
+                    return
+                if current.get("interrupted"):
+                    return
+                rolling_pcm.extend(pcm)
+                if len(rolling_pcm) > max_pcm_bytes:
+                    del rolling_pcm[:-max_pcm_bytes]
+                candidate_pcm = bytes(rolling_pcm)
+                accepted, reason, stats = should_accept_interrupt_pcm_chunk(candidate_pcm)
+                now = time.monotonic()
+                if now - last_debug_monotonic >= 0.5:
+                    last_debug_monotonic = now
+                    logger.info(
+                        "Interrupt-listen audio guild=%s user=%s accepted=%s reason=%s stats=%s",
+                        guild.id,
+                        user.id,
+                        accepted,
+                        reason,
+                        stats,
+                    )
+                if not accepted:
+                    return
+                if now - last_accept_monotonic < 0.5:
+                    return
+                last_accept_monotonic = now
+                current["interrupt_user"] = user
+                current["interrupted"] = True
+                current["capture_active"] = True
+                current["capture_pcm_chunks"] = [candidate_pcm]
+                schedule_interrupt_finalize(guild.id)
+                rolling_pcm.clear()
+                logger.info(
+                    "Interrupt speech detected guild=%s user=%s stats=%s; stopping active playback",
+                    guild.id,
+                    user.id,
+                    stats,
+                )
+                request_tts_interrupt(guild.id, user_id=getattr(user, "id", None), stats=stats)
+            except Exception:
+                logger.exception("Interrupt-listen raw callback failed guild=%s user=%s", guild.id, getattr(user, "id", None))
+
+        sink = voice_recv.BasicSink(interrupt_cb)
+        AUTO_LISTEN_SESSIONS[guild.id] = {
+            "voice_client": voice_client,
+            "guild": guild,
+            "text_channel": text_channel,
+            "busy": False,
+            "last_text": "",
+            "interrupt_only": True,
+            "interrupted": False,
+            "capture_active": False,
+            "capture_pcm_chunks": [],
+            "interrupt_user": None,
+            "finalize_handle": None,
+        }
+
+        def after_interrupt_listen(exc: Exception | None) -> None:
+            try:
+                sink.cleanup()
+            except Exception:
+                logger.exception("Failed cleaning up interrupt-listen sink guild=%s", guild.id)
+            if exc:
+                logger.exception("Interrupt-listen callback reported an error guild=%s", guild.id, exc_info=exc)
+            current = AUTO_LISTEN_SESSIONS.get(guild.id)
+            if current and current.get("voice_client") is voice_client and guild.id not in ACTIVE_RECORDINGS:
+                AUTO_LISTEN_SESSIONS.pop(guild.id, None)
+
+        voice_client.listen(sink, after=after_interrupt_listen)
+        logger.info(
+            "Started interrupt-listen guild=%s voice_channel=%s text_channel=%s",
+            guild.id,
+            voice_client.channel.id if voice_client.channel else None,
+            getattr(text_channel, "id", None),
+        )
+        return
+
+    pause_threshold = 0.35 if interrupt_only else get_auto_listen_silence_seconds()
+    phrase_limit = 2 if interrupt_only else get_auto_listen_phrase_limit_seconds()
 
     def process_cb(recognizer, audio, user):
         try:
             if user is None or (client.user and user.id == client.user.id):
                 return None
             audio_data = audio.get_wav_data()
-            accepted, reason, stats = should_accept_auto_audio_chunk(audio_data)
+            accepted, reason, stats = (
+                should_accept_interrupt_audio_chunk(audio_data)
+                if interrupt_only
+                else should_accept_auto_audio_chunk(audio_data)
+            )
             if not accepted:
                 logger.info(
-                    "Rejected auto-listen audio chunk guild=%s user=%s reason=%s stats=%s",
+                    "Rejected %s audio chunk guild=%s user=%s reason=%s stats=%s",
+                    "interrupt-listen" if interrupt_only else "auto-listen",
                     guild.id,
                     user.id,
                     reason,
                     stats,
                 )
                 return None
+            if interrupt_only:
+                current = AUTO_LISTEN_SESSIONS.get(guild.id)
+                if current and current.get("interrupt_only") and not current.get("interrupted"):
+                    current["interrupted"] = True
+                    logger.info(
+                        "Interrupt speech detected guild=%s user=%s stats=%s; stopping active playback",
+                        guild.id,
+                        user.id,
+                        stats,
+                    )
+                    client.loop.call_soon_threadsafe(voice_client.stop)
+                return None
             text, info, rms, applied_gain = transcribe_wav_bytes(audio_data)
             logger.info(
-                "Auto-listen speech callback completed guild=%s user=%s language=%s duration=%s chars=%s rms=%s gain=%s",
+                "%s speech callback completed guild=%s user=%s language=%s duration=%s chars=%s rms=%s gain=%s",
+                "Interrupt-listen" if interrupt_only else "Auto-listen",
                 guild.id,
                 user.id,
                 getattr(info, "language", None),
@@ -1747,13 +2272,26 @@ async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None)
             )
             return text or None
         except Exception:
-            logger.exception("Auto-listen speech callback failed guild=%s user=%s", guild.id, getattr(user, "id", None))
+            logger.exception(
+                "%s speech callback failed guild=%s user=%s",
+                "Interrupt-listen" if interrupt_only else "Auto-listen",
+                guild.id,
+                getattr(user, "id", None),
+            )
             return None
 
     def text_cb(user, text):
+        if interrupt_only:
+            return
         if user is None or not text or not text.strip():
             return
-        logger.info("Auto-listen text guild=%s user=%s text=%s", guild.id, user.id, text)
+        logger.info(
+            "%s text guild=%s user=%s text=%s",
+            "Interrupt-listen" if interrupt_only else "Auto-listen",
+            guild.id,
+            user.id,
+            text,
+        )
         asyncio.run_coroutine_threadsafe(handle_auto_transcript(guild.id, user, text), client.loop)
 
     sink = TunedSpeechRecognitionSink(
@@ -1771,22 +2309,34 @@ async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None)
         "text_channel": text_channel,
         "busy": False,
         "last_text": "",
+        "interrupt_only": interrupt_only,
+        "interrupted": False,
     }
 
     def after_auto_listen(exc: Exception | None) -> None:
         try:
             sink.cleanup()
         except Exception:
-            logger.exception("Failed cleaning up auto-listen sink guild=%s", guild.id)
+            logger.exception(
+                "Failed cleaning up %s sink guild=%s",
+                "interrupt-listen" if interrupt_only else "auto-listen",
+                guild.id,
+            )
         if exc:
-            logger.exception("Auto-listen callback reported an error guild=%s", guild.id, exc_info=exc)
+            logger.exception(
+                "%s callback reported an error guild=%s",
+                "Interrupt-listen" if interrupt_only else "Auto-listen",
+                guild.id,
+                exc_info=exc,
+            )
         current = AUTO_LISTEN_SESSIONS.get(guild.id)
         if current and current.get("voice_client") is voice_client and guild.id not in ACTIVE_RECORDINGS:
             AUTO_LISTEN_SESSIONS.pop(guild.id, None)
 
     voice_client.listen(sink, after=after_auto_listen)
     logger.info(
-        "Started auto-listen guild=%s voice_channel=%s pause_threshold=%s phrase_limit=%s text_channel=%s",
+        "Started %s guild=%s voice_channel=%s pause_threshold=%s phrase_limit=%s text_channel=%s",
+        "interrupt-listen" if interrupt_only else "auto-listen",
         guild.id,
         voice_client.channel.id if voice_client.channel else None,
         pause_threshold,
