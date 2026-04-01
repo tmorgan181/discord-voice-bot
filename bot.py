@@ -1378,16 +1378,19 @@ async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
         logger.info("Ignoring auto transcript while another auto response is in flight guild=%s user=%s", guild_id, user.id)
         return
 
-    channel = await resolve_text_channel_for_guild(session["guild"], session.get("text_channel"))
+    guild = session["guild"]
+    fallback_channel = session.get("text_channel")
+    channel = await resolve_text_channel_for_guild(guild, fallback_channel)
     if channel is None:
         logger.warning("Auto-listen could not resolve a text channel for guild=%s", guild_id)
         return
 
     session["busy"] = True
     session["last_text"] = text.strip()
+    stop_auto_listen(guild_id)
     try:
         await channel.send(f"Heard {getattr(user, 'display_name', user)}: {text.strip()}")
-        message_like = SimpleNamespace(guild=session["guild"], channel=channel, author=user)
+        message_like = SimpleNamespace(guild=guild, channel=channel, author=user)
         await respond_with_ollama(
             message_like,
             text.strip(),
@@ -1395,7 +1398,9 @@ async def handle_auto_transcript(guild_id: int, user, text: str) -> None:
             log_source="auto",
         )
     finally:
-        session["busy"] = False
+        current = AUTO_LISTEN_SESSIONS.get(guild_id)
+        if current is not None:
+            current["busy"] = False
 
 
 async def ensure_auto_listen(guild: discord.Guild | None, fallback_channel=None) -> None:
