@@ -1528,6 +1528,14 @@ async def remove_control_message_reaction(channel: discord.abc.Messageable) -> N
         logger.exception("Failed to remove control reaction")
 
 
+async def remove_control_message_reaction_for_guild(guild: discord.Guild) -> None:
+    channel = await resolve_text_channel_for_guild(guild)
+    if channel is None:
+        logger.warning("Could not resolve a text channel for control reaction cleanup guild=%s", guild.id)
+        return
+    await remove_control_message_reaction(channel)
+
+
 async def resolve_text_channel_for_guild(
     guild: discord.Guild, fallback_channel: discord.abc.Messageable | None = None
 ):
