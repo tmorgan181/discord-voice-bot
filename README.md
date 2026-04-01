@@ -71,11 +71,11 @@ Phase 3 starter adds:
 
 ## Environment variables
 
-- `DISCORD_ECHO_TOKEN`: required
+- `DISCORD_BOT_TOKEN`: required
 - `OLLAMA_MODEL`: optional, defaults to `llama3.2`
 - `OLLAMA_BASE_URL`: optional, defaults to `http://127.0.0.1:11434`
-- `ECHO_SYSTEM_PROMPT`: optional full system prompt template for Ollama. Supports `{bot_name}`, `{guild_name}`, `{channel_name}`, and `{user_name}`
-- `ECHO_CHAMBER_CHANNEL_ID`: optional, only respond in that channel when set
+- `BOT_SYSTEM_PROMPT`: optional full system prompt template for Ollama. Supports `{bot_name}`, `{guild_name}`, `{channel_name}`, and `{user_name}`
+- `BOT_ALLOWED_CHANNEL_ID`: optional, only respond in that channel when set
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`
@@ -83,3 +83,9 @@ Phase 3 starter adds:
 - `WHISPER_AUDIO_GAIN`: optional gain multiplier applied before transcription, defaults to `3.0`
 - `TTS_AUDIO_DIR`: optional, defaults to `generated_audio`
 - `RUNTIME_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped log file per run
+
+Backward-compatible aliases still work:
+
+- `DISCORD_ECHO_TOKEN`
+- `ECHO_SYSTEM_PROMPT`
+- `ECHO_CHAMBER_CHANNEL_ID`

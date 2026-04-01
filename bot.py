@@ -66,6 +66,14 @@ def get_required_env(*names: str) -> str:
     raise RuntimeError(f"Missing required environment variable. Tried: {joined}")
 
 
+def get_env_value(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
 def resolve_runtime_log_path() -> Path:
     configured = os.getenv("RUNTIME_LOG_PATH", "").strip()
     if configured:
@@ -182,12 +190,12 @@ def ask_ollama(prompt: str) -> str:
 
 
 def build_system_prompt(message: discord.Message) -> str | None:
-    template = os.getenv("ECHO_SYSTEM_PROMPT", "").strip()
+    template = get_env_value("BOT_SYSTEM_PROMPT", "ECHO_SYSTEM_PROMPT", default="").strip()
     if not template:
         return None
 
     context = {
-        "bot_name": str(client.user) if client.user else "Echo",
+        "bot_name": client.user.name if client.user else "Bot",
         "guild_name": message.guild.name if message.guild else "",
         "channel_name": getattr(message.channel, "name", ""),
         "user_name": (
@@ -200,7 +208,7 @@ def build_system_prompt(message: discord.Message) -> str | None:
     try:
         return template.format(**context)
     except KeyError as exc:
-        logger.warning("Unknown placeholder in ECHO_SYSTEM_PROMPT: %s", exc)
+        logger.warning("Unknown placeholder in BOT_SYSTEM_PROMPT/ECHO_SYSTEM_PROMPT: %s", exc)
         return template
 
 
@@ -349,7 +357,7 @@ def synthesize_tts_to_file(text: str) -> Path:
     audio_dir = Path(os.getenv("TTS_AUDIO_DIR", DEFAULT_AUDIO_DIR))
     audio_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_path = audio_dir / f"echo-{uuid.uuid4().hex}.wav"
+    audio_path = audio_dir / f"tts-{uuid.uuid4().hex}.wav"
     engine = pyttsx3.init()
     engine.save_to_file(text, str(audio_path))
     engine.runAndWait()
@@ -579,7 +587,7 @@ def voice_state_snapshot(voice_client: discord.VoiceClient | None) -> dict:
 
 
 def is_idle_keepalive_active(voice_client: discord.VoiceClient | None) -> bool:
-    return bool(voice_client and getattr(voice_client, "_echo_idle_keepalive", False))
+    return bool(voice_client and getattr(voice_client, "_idle_keepalive_active", False))
 
 
 def start_idle_keepalive(voice_client: discord.VoiceClient) -> None:
@@ -598,7 +606,7 @@ def start_idle_keepalive(voice_client: discord.VoiceClient) -> None:
         before_options="-f lavfi",
         options="-f s16le -ar 48000 -ac 2",
     )
-    setattr(voice_client, "_echo_idle_keepalive", True)
+    setattr(voice_client, "_idle_keepalive_active", True)
     voice_client.play(source)
     logger.info(
         "Started silent keepalive playback in channel %s",
@@ -612,7 +620,7 @@ def stop_idle_keepalive(voice_client: discord.VoiceClient) -> None:
             "Stopping silent keepalive playback in channel %s",
             voice_client.channel.id if voice_client.channel else None,
         )
-        setattr(voice_client, "_echo_idle_keepalive", False)
+        setattr(voice_client, "_idle_keepalive_active", False)
         voice_client.stop()
 
 
@@ -805,7 +813,7 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     def cleanup(error: Exception | None) -> None:
         if error:
             logger.exception("Voice playback error", exc_info=error)
-        setattr(voice_client, "_echo_idle_keepalive", False)
+        setattr(voice_client, "_idle_keepalive_active", False)
         try:
             audio_path.unlink(missing_ok=True)
         except OSError:
@@ -1003,8 +1011,8 @@ log_voice_backend_status()
 log_phase3_backend_status()
 patch_voice_recv_decoder()
 
-token = get_required_env("DISCORD_ECHO_TOKEN", "DISCORD_BOT_TOKEN")
-allowed_channel_id = os.getenv("ECHO_CHAMBER_CHANNEL_ID")
+token = get_required_env("DISCORD_BOT_TOKEN", "DISCORD_ECHO_TOKEN")
+allowed_channel_id = get_env_value("BOT_ALLOWED_CHANNEL_ID", "ECHO_CHAMBER_CHANNEL_ID")
 if allowed_channel_id:
     allowed_channel_id = int(allowed_channel_id)
 conversation_logging_enabled = env_flag("ENABLE_CONVERSATION_LOGGING")
@@ -1198,7 +1206,7 @@ async def on_message(message: discord.Message) -> None:
         await respond_with_ollama(
             message,
             transcript,
-            send_prefix="Echo: ",
+            send_prefix=None,
             speak_reply=True,
             log_source="voice",
         )
