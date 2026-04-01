@@ -51,6 +51,8 @@ DEFAULT_AUTO_LISTEN_MIN_AUDIO_SECONDS = 0.9
 DEFAULT_AUTO_LISTEN_WINDOW_MS = 20
 DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS = 900.0
 DEFAULT_AUTO_LISTEN_MIN_VOICED_WINDOWS = 8
+DEFAULT_AUTO_LISTEN_MIN_VOICED_RATIO = 0.2
+DEFAULT_AUTO_LISTEN_MAX_ZERO_CROSSING_RATE = 0.3
 DEFAULT_AUDIO_GAIN = 1.15
 DEFAULT_TARGET_RMS = 14000.0
 DEFAULT_MAX_AUDIO_GAIN = 6.0
@@ -151,6 +153,17 @@ def get_auto_listen_voiced_window_rms() -> float:
 
 def get_auto_listen_min_voiced_windows() -> int:
     return max(1, get_env_int("BOT_AUTO_LISTEN_MIN_VOICED_WINDOWS", DEFAULT_AUTO_LISTEN_MIN_VOICED_WINDOWS))
+
+
+def get_auto_listen_min_voiced_ratio() -> float:
+    return max(0.0, min(1.0, get_env_float("BOT_AUTO_LISTEN_MIN_VOICED_RATIO", DEFAULT_AUTO_LISTEN_MIN_VOICED_RATIO)))
+
+
+def get_auto_listen_max_zero_crossing_rate() -> float:
+    return max(
+        0.0,
+        min(1.0, get_env_float("BOT_AUTO_LISTEN_MAX_ZERO_CROSSING_RATE", DEFAULT_AUTO_LISTEN_MAX_ZERO_CROSSING_RATE)),
+    )
 
 
 def resolve_runtime_log_path() -> Path:
@@ -769,6 +782,26 @@ def compute_pcm_peak_abs(frames: bytes, sample_width: int) -> int:
     return max(abs(sample) for sample in samples)
 
 
+def compute_zero_crossing_rate(frames: bytes, sample_width: int) -> float:
+    if not frames or sample_width != 2:
+        return 0.0
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if len(samples) < 2:
+        return 0.0
+
+    crossings = 0
+    previous_sign = 1 if samples[0] >= 0 else -1
+    for sample in samples[1:]:
+        sign = 1 if sample >= 0 else -1
+        if sign != previous_sign:
+            crossings += 1
+        previous_sign = sign
+
+    return crossings / max(1, len(samples) - 1)
+
+
 def compute_audio_duration_seconds(frame_count: int, sample_rate: int) -> float:
     if frame_count <= 0 or sample_rate <= 0:
         return 0.0
@@ -798,6 +831,40 @@ def count_voiced_windows(
     return voiced
 
 
+def analyze_voiced_windows(
+    frames: bytes,
+    sample_width: int,
+    sample_rate: int,
+    *,
+    window_ms: int = DEFAULT_AUTO_LISTEN_WINDOW_MS,
+    rms_threshold: float = DEFAULT_AUTO_LISTEN_VOICED_WINDOW_RMS,
+) -> tuple[int, int, float]:
+    if not frames or sample_width != 2 or sample_rate <= 0:
+        return 0, 0, 0.0
+
+    window_frames = max(1, int(sample_rate * (window_ms / 1000)))
+    window_bytes = window_frames * sample_width
+    voiced = 0
+    total = 0
+    voiced_zero_crossing_rates: list[float] = []
+
+    for offset in range(0, len(frames), window_bytes):
+        chunk = frames[offset : offset + window_bytes]
+        if not chunk:
+            continue
+        total += 1
+        if compute_pcm_rms(chunk, sample_width) >= rms_threshold:
+            voiced += 1
+            voiced_zero_crossing_rates.append(compute_zero_crossing_rate(chunk, sample_width))
+
+    average_voiced_zcr = (
+        sum(voiced_zero_crossing_rates) / len(voiced_zero_crossing_rates)
+        if voiced_zero_crossing_rates
+        else 0.0
+    )
+    return voiced, total, average_voiced_zcr
+
+
 def should_accept_auto_audio_chunk(audio_bytes: bytes) -> tuple[bool, str, dict]:
     with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
         params = reader.getparams()
@@ -805,24 +872,31 @@ def should_accept_auto_audio_chunk(audio_bytes: bytes) -> tuple[bool, str, dict]
 
     duration_seconds = compute_audio_duration_seconds(params.nframes, params.framerate)
     rms = compute_pcm_rms(frames, params.sampwidth)
-    voiced_windows = count_voiced_windows(
+    voiced_windows, total_windows, average_voiced_zcr = analyze_voiced_windows(
         frames,
         params.sampwidth,
         params.framerate,
         window_ms=DEFAULT_AUTO_LISTEN_WINDOW_MS,
         rms_threshold=get_auto_listen_voiced_window_rms(),
     )
+    voiced_ratio = (voiced_windows / total_windows) if total_windows else 0.0
 
     stats = {
         "duration_seconds": round(duration_seconds, 3),
         "rms": round(rms, 1),
         "voiced_windows": voiced_windows,
+        "voiced_ratio": round(voiced_ratio, 3),
+        "avg_voiced_zcr": round(average_voiced_zcr, 3),
     }
 
     if duration_seconds < get_auto_listen_min_audio_seconds():
         return False, "too_short", stats
     if voiced_windows < get_auto_listen_min_voiced_windows():
         return False, "not_enough_voiced_windows", stats
+    if voiced_ratio < get_auto_listen_min_voiced_ratio():
+        return False, "not_enough_voiced_ratio", stats
+    if average_voiced_zcr > get_auto_listen_max_zero_crossing_rate():
+        return False, "too_noisy", stats
     return True, "accepted", stats
 
 
@@ -1141,6 +1215,7 @@ async def force_leave_guild_voice(guild: discord.Guild, *, reason: str) -> bool:
         )
 
     clear_conversation_history(guild.id)
+    await remove_control_message_reaction_for_guild(guild)
     return remaining_voice_channel is None
 
 
@@ -1962,9 +2037,15 @@ async def on_ready() -> None:
     logger.info("Logged in as %s (id=%s)", client.user, client.user.id if client.user else None)
     for guild in client.guilds:
         try:
-            await force_leave_guild_voice(guild, reason="startup_cleanup")
+            bot_voice_channel = await fetch_bot_voice_channel(guild)
+            if bot_voice_channel is not None:
+                logger.info(
+                    "Bot still appears connected in guild=%s channel=%s after restart; leaving server-side voice state untouched",
+                    guild.id,
+                    bot_voice_channel.id,
+                )
         except Exception:
-            logger.exception("Startup voice cleanup failed for guild %s", guild.id)
+            logger.exception("Startup voice state check failed for guild %s", guild.id)
     if health_monitor_task is None or health_monitor_task.done():
         health_monitor_task = asyncio.create_task(voice_health_monitor())
         logger.info("Started voice health monitor task")
@@ -2002,6 +2083,7 @@ async def on_voice_state_update(
     if after.channel is None:
         stop_auto_listen(member.guild.id, disable=True)
         clear_conversation_history(member.guild.id)
+        await remove_control_message_reaction_for_guild(member.guild)
 
 
 @client.event

@@ -94,6 +94,8 @@ Phase 3 starter adds:
 - `BOT_AUTO_LISTEN_MIN_AUDIO_SECONDS`: optional minimum audio duration required before a hands-free chunk is considered, defaults to `0.9`
 - `BOT_AUTO_LISTEN_VOICED_WINDOW_RMS`: optional RMS threshold for a chunk window to count as voiced, defaults to `900`
 - `BOT_AUTO_LISTEN_MIN_VOICED_WINDOWS`: optional minimum number of voiced windows required before a hands-free chunk is accepted, defaults to `8`
+- `BOT_AUTO_LISTEN_MIN_VOICED_RATIO`: optional minimum fraction of windows that must look voiced before a hands-free chunk is accepted, defaults to `0.2`
+- `BOT_AUTO_LISTEN_MAX_ZERO_CROSSING_RATE`: optional maximum average zero-crossing rate across voiced windows before a chunk is treated as noise, defaults to `0.3`
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`
