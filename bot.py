@@ -9,6 +9,7 @@ import uuid
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import discord
 from discord.opus import OpusError
@@ -38,6 +39,7 @@ VOICE_RETRY_DELAY_SECONDS = 2
 VOICE_HEALTH_LOG_INTERVAL_SECONDS = 30
 DEFAULT_RECORD_SECONDS = 10
 MAX_RECORD_SECONDS = 30
+DEFAULT_REACTION_RECORD_SECONDS = 600
 DEFAULT_AUDIO_GAIN = 3.0
 FFMPEG_SILENCE_INPUT = "anullsrc=r=48000:cl=stereo"
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -48,6 +50,7 @@ ACTIVE_RECORDINGS: dict[int, dict] = {}
 VOICE_RECV_PATCHED = False
 ACTIVE_RECORDING_SSRCS: set[int] = set()
 CORRUPT_PACKET_COUNTS: dict[int, int] = {}
+REACTION_RECORDING_TASKS: dict[int, asyncio.Task] = {}
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -353,6 +356,88 @@ async def respond_with_ollama(
     return answer
 
 
+async def handle_record_or_talk(
+    context,
+    duration_seconds: int,
+    *,
+    mode: str,
+) -> None:
+    try:
+        voice_client = await ensure_voice_client(context)
+        if voice_client is None:
+            return
+        logger.info(
+            "Voice capture accepted mode=%s guild=%s channel=%s user=%s duration=%s",
+            mode,
+            context.guild.id if context.guild else None,
+            context.channel.id,
+            context.author.id,
+            duration_seconds,
+        )
+        if context.guild and context.guild.id in ACTIVE_RECORDINGS:
+            await send_error(
+                context.channel,
+                "A recording is already in progress. Use `!stop` first if you want to end it early.",
+            )
+            return
+        status_text = "Recording and listening" if mode == "talk" else "Recording"
+        await context.channel.send(f"{status_text} for {duration_seconds} seconds...")
+        async with context.channel.typing():
+            transcript = await run_speech_recognition_capture(
+                voice_client,
+                duration_seconds,
+                context.guild.id,
+                context.author,
+            )
+    except discord.ClientException:
+        logger.exception("Discord voice error during recording")
+        await send_error(
+            context.channel,
+            "I couldn't access the voice channel for recording. Try `!join` again first.",
+        )
+        return
+    except RuntimeError as exc:
+        logger.exception("Speech recognition runtime check failed")
+        await send_error(
+            context.channel,
+            f"Recording or speech recognition failed: {exc}",
+        )
+        return
+    except Exception:
+        logger.exception("Recording or speech recognition failed")
+        await send_error(
+            context.channel,
+            "Recording or speech recognition failed. Check the runtime log for details.",
+        )
+        return
+
+    if not transcript:
+        logger.info("Speech recognition completed with no detectable speech")
+        transcript = "[No speech detected]"
+    else:
+        logger.info(
+            "Speech recognition completed successfully chars=%s",
+            len(transcript),
+        )
+
+    if mode == "record":
+        await context.channel.send(f"Transcript: {transcript}")
+        return
+
+    if transcript == "[No speech detected]":
+        await context.channel.send(f"Transcript: {transcript}")
+        return
+
+    await context.channel.send(f"Heard: {transcript}")
+    await respond_with_ollama(
+        context,
+        transcript,
+        send_prefix=None,
+        speak_reply=True,
+        log_source="voice",
+    )
+
+
 def synthesize_tts_to_file(text: str) -> Path:
     audio_dir = Path(os.getenv("TTS_AUDIO_DIR", DEFAULT_AUDIO_DIR))
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -530,7 +615,11 @@ async def handle_clear_command(message: discord.Message, content: str) -> None:
 
     try:
         purge_limit = None if count is None else count + 1
-        deleted = await channel.purge(limit=purge_limit, bulk=True)
+        deleted = await channel.purge(
+            limit=purge_limit,
+            bulk=True,
+            check=lambda msg: not msg.pinned,
+        )
         deleted_count = max(len(deleted) - 1, 0)
         logger.info(
             "Cleared %s messages in channel %s requested by user %s limit=%s",
@@ -584,6 +673,18 @@ def voice_state_snapshot(voice_client: discord.VoiceClient | None) -> dict:
         "paused": voice_client.is_paused(),
         "latency": getattr(voice_client, "latency", None),
     }
+
+
+def get_current_voice_client(guild: discord.Guild | None) -> discord.VoiceClient | None:
+    if guild is None:
+        return None
+    if guild.voice_client is not None:
+        return guild.voice_client
+
+    for voice_client in client.voice_clients:
+        if voice_client.guild and voice_client.guild.id == guild.id:
+            return voice_client
+    return None
 
 
 def is_idle_keepalive_active(voice_client: discord.VoiceClient | None) -> bool:
@@ -689,7 +790,7 @@ async def connect_voice_with_retries(
 
     for attempt in range(1, VOICE_CONNECT_RETRIES + 1):
         try:
-            voice_client = guild.voice_client
+            voice_client = get_current_voice_client(guild)
             logger.info(
                 "Voice connect attempt %s/%s for guild=%s target_channel=%s existing_state=%s",
                 attempt,
@@ -712,15 +813,15 @@ async def connect_voice_with_retries(
                         )
                         start_idle_keepalive(voice_client)
                         return voice_client
-                if guild.voice_client:
+                if get_current_voice_client(guild):
                     await reset_voice_client(guild)
-                voice_client = guild.voice_client
+                voice_client = get_current_voice_client(guild)
 
             if voice_client:
                 if not isinstance(voice_client, voice_recv.VoiceRecvClient):
                     logger.info("Resetting non-receive voice client before move/connect")
                     await reset_voice_client(guild)
-                    voice_client = guild.voice_client
+                    voice_client = get_current_voice_client(guild)
 
             if voice_client and voice_client.channel and voice_client.channel.id == target_channel.id:
                 if voice_client.is_connected():
@@ -787,18 +888,33 @@ async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvC
         await send_error(message.channel, "Voice features only work inside a server.")
         return None
 
-    if not isinstance(message.author, discord.Member) or not message.author.voice:
-        await send_error(message.channel, "Join a voice channel first, then try again.")
-        return None
+    configured_voice_channel_id = get_env_value("BOT_VOICE_CHANNEL_ID")
+    target_channel: discord.VoiceChannel | None = None
 
-    target_channel = message.author.voice.channel
+    if configured_voice_channel_id:
+        channel = message.guild.get_channel(int(configured_voice_channel_id))
+        if not isinstance(channel, discord.VoiceChannel):
+            await send_error(
+                message.channel,
+                "The configured `BOT_VOICE_CHANNEL_ID` is missing or is not a voice channel.",
+            )
+            return None
+        target_channel = channel
+    else:
+        if not isinstance(message.author, discord.Member) or not message.author.voice:
+            await send_error(message.channel, "Join a voice channel first, then try again.")
+            return None
+        target_channel = message.author.voice.channel
+
     logger.info(
         "Ensuring voice client for guild=%s channel=%s user=%s",
         message.guild.id,
         target_channel.id,
         message.author.id,
     )
-    return await connect_voice_with_retries(message.guild, target_channel)
+    voice_client = await connect_voice_with_retries(message.guild, target_channel)
+    await ensure_control_message_reaction(message.channel)
+    return voice_client
 
 
 async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
@@ -830,6 +946,81 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     source = discord.FFmpegPCMAudio(str(audio_path))
     voice_client.play(source, after=cleanup)
     logger.info("Started voice playback in channel %s", voice_client.channel.id)
+
+
+async def ensure_control_message_reaction(channel: discord.abc.Messageable) -> None:
+    if not reaction_control_message_id or not hasattr(channel, "fetch_message"):
+        return
+
+    try:
+        control_message = await channel.fetch_message(reaction_control_message_id)
+    except discord.NotFound:
+        logger.warning(
+            "Configured reaction control message was not found in channel=%s message_id=%s",
+            getattr(channel, "id", None),
+            reaction_control_message_id,
+        )
+        return
+    except discord.Forbidden:
+        logger.exception("Missing permissions to fetch reaction control message")
+        return
+    except discord.HTTPException:
+        logger.exception("Failed to fetch reaction control message")
+        return
+
+    existing_reaction = discord.utils.find(
+        lambda reaction: str(reaction.emoji) == reaction_control_emoji,
+        control_message.reactions,
+    )
+    if existing_reaction:
+        return
+
+    try:
+        await control_message.add_reaction(reaction_control_emoji)
+        logger.info(
+            "Added control reaction emoji=%s to message_id=%s channel=%s",
+            reaction_control_emoji,
+            reaction_control_message_id,
+            getattr(channel, "id", None),
+        )
+    except discord.Forbidden:
+        logger.exception("Missing permissions to add control reaction")
+    except discord.HTTPException:
+        logger.exception("Failed to add control reaction")
+
+
+async def remove_control_message_reaction(channel: discord.abc.Messageable) -> None:
+    if not reaction_control_message_id or not hasattr(channel, "fetch_message") or not client.user:
+        return
+
+    try:
+        control_message = await channel.fetch_message(reaction_control_message_id)
+    except discord.NotFound:
+        logger.warning(
+            "Configured reaction control message was not found during cleanup channel=%s message_id=%s",
+            getattr(channel, "id", None),
+            reaction_control_message_id,
+        )
+        return
+    except discord.Forbidden:
+        logger.exception("Missing permissions to fetch reaction control message during cleanup")
+        return
+    except discord.HTTPException:
+        logger.exception("Failed to fetch reaction control message during cleanup")
+        return
+
+    try:
+        await control_message.remove_reaction(reaction_control_emoji, client.user)
+        logger.info(
+            "Removed control reaction emoji=%s from message_id=%s channel=%s",
+            reaction_control_emoji,
+            reaction_control_message_id,
+            getattr(channel, "id", None),
+        )
+    except discord.Forbidden:
+        logger.exception("Missing permissions to remove control reaction")
+    except discord.HTTPException:
+        logger.exception("Failed to remove control reaction")
 
 
 async def run_speech_recognition_capture(
@@ -1012,14 +1203,22 @@ log_phase3_backend_status()
 patch_voice_recv_decoder()
 
 token = get_required_env("DISCORD_BOT_TOKEN", "DISCORD_ECHO_TOKEN")
-allowed_channel_id = get_env_value("BOT_ALLOWED_CHANNEL_ID", "ECHO_CHAMBER_CHANNEL_ID")
-if allowed_channel_id:
-    allowed_channel_id = int(allowed_channel_id)
+text_channel_id = get_env_value("BOT_TEXT_CHANNEL_ID", "BOT_ALLOWED_CHANNEL_ID", "ECHO_CHAMBER_CHANNEL_ID")
+if text_channel_id:
+    text_channel_id = int(text_channel_id)
+reaction_control_message_id = get_env_value("BOT_REACTION_MESSAGE_ID")
+if reaction_control_message_id:
+    reaction_control_message_id = int(reaction_control_message_id)
+reaction_control_emoji = get_env_value("BOT_REACTION_EMOJI", default="🎙️")
+reaction_record_seconds = int(
+    get_env_value("BOT_REACTION_RECORD_SECONDS", default=str(DEFAULT_REACTION_RECORD_SECONDS))
+)
 conversation_logging_enabled = env_flag("ENABLE_CONVERSATION_LOGGING")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
+intents.reactions = True
 
 client = discord.Client(intents=intents)
 health_monitor_task: asyncio.Task | None = None
@@ -1070,7 +1269,7 @@ async def on_message(message: discord.Message) -> None:
     if message.author == client.user:
         return
 
-    if allowed_channel_id is not None and message.channel.id != allowed_channel_id:
+    if text_channel_id is not None and message.channel.id != text_channel_id:
         return
 
     content = message.content.strip()
@@ -1100,14 +1299,16 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if command == "!leave":
-        if message.guild and message.guild.voice_client:
+        voice_client = get_current_voice_client(message.guild)
+        if message.guild and voice_client:
             logger.info(
                 "Manual voice disconnect requested guild=%s state=%s",
                 message.guild.id,
-                voice_state_snapshot(message.guild.voice_client),
+                voice_state_snapshot(voice_client),
             )
-            stop_idle_keepalive(message.guild.voice_client)
-            await message.guild.voice_client.disconnect(force=True)
+            stop_idle_keepalive(voice_client)
+            await voice_client.disconnect(force=True)
+            await remove_control_message_reaction(message.channel)
             logger.info("Disconnected from voice in guild %s", message.guild.id)
             await message.channel.send("Left the voice channel.")
         else:
@@ -1137,78 +1338,10 @@ async def on_message(message: discord.Message) -> None:
             )
             return
 
-        try:
-            voice_client = await ensure_voice_client(message)
-            if voice_client is None:
-                return
-            logger.info(
-                "Record command accepted guild=%s channel=%s user=%s duration=%s",
-                message.guild.id if message.guild else None,
-                message.channel.id,
-                message.author.id,
-                duration_seconds,
-            )
-            if message.guild and message.guild.id in ACTIVE_RECORDINGS:
-                await send_error(
-                    message.channel,
-                    "A recording is already in progress. Use `!stop` first if you want to end it early.",
-                )
-                return
-            status_text = "Recording and listening" if command == "!talk" else "Recording"
-            await message.channel.send(f"{status_text} for {duration_seconds} seconds...")
-            async with message.channel.typing():
-                transcript = await run_speech_recognition_capture(
-                    voice_client,
-                    duration_seconds,
-                    message.guild.id,
-                    message.author,
-                )
-        except discord.ClientException:
-            logger.exception("Discord voice error during recording")
-            await send_error(
-                message.channel,
-                "I couldn't access the voice channel for recording. Try `!join` again first.",
-            )
-            return
-        except RuntimeError as exc:
-            logger.exception("Speech recognition runtime check failed")
-            await send_error(
-                message.channel,
-                f"Recording or speech recognition failed: {exc}",
-            )
-            return
-        except Exception:
-            logger.exception("Recording or speech recognition failed")
-            await send_error(
-                message.channel,
-                "Recording or speech recognition failed. Check the runtime log for details.",
-            )
-            return
-
-        if not transcript:
-            logger.info("Speech recognition completed with no detectable speech")
-            transcript = "[No speech detected]"
-        else:
-            logger.info(
-                "Speech recognition completed successfully chars=%s",
-                len(transcript),
-            )
-
-        if command == "!record":
-            await message.channel.send(f"Transcript: {transcript}")
-            return
-
-        if transcript == "[No speech detected]":
-            await message.channel.send(f"Transcript: {transcript}")
-            return
-
-        await message.channel.send(f"Heard: {transcript}")
-        await respond_with_ollama(
+        await handle_record_or_talk(
             message,
-            transcript,
-            send_prefix=None,
-            speak_reply=True,
-            log_source="voice",
+            duration_seconds,
+            mode="talk" if command == "!talk" else "record",
         )
         return
 
@@ -1218,17 +1351,18 @@ async def on_message(message: discord.Message) -> None:
         if message.guild and stop_active_recording(message.guild.id):
             stopped_anything = True
 
-        if message.guild and message.guild.voice_client and message.guild.voice_client.is_playing():
+        voice_client = get_current_voice_client(message.guild)
+        if voice_client and voice_client.is_playing():
             logger.info(
                 "Stop requested for active playback in guild=%s state=%s",
                 message.guild.id,
-                voice_state_snapshot(message.guild.voice_client),
+                voice_state_snapshot(voice_client),
             )
-            stop_idle_keepalive(message.guild.voice_client)
-            if message.guild.voice_client.is_playing():
-                message.guild.voice_client.stop()
-            if message.guild.voice_client.is_connected():
-                start_idle_keepalive(message.guild.voice_client)
+            stop_idle_keepalive(voice_client)
+            if voice_client.is_playing():
+                voice_client.stop()
+            if voice_client.is_connected():
+                start_idle_keepalive(voice_client)
             stopped_anything = True
 
         if not stopped_anything:
@@ -1249,6 +1383,128 @@ async def on_message(message: discord.Message) -> None:
         speak_reply=True,
         log_source="text",
     )
+
+
+def is_matching_control_reaction(payload: discord.RawReactionActionEvent) -> bool:
+    return bool(
+        reaction_control_message_id
+        and payload.message_id == reaction_control_message_id
+        and str(payload.emoji) == reaction_control_emoji
+    )
+
+
+async def fetch_reaction_context(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id:
+        return None
+
+    guild = client.get_guild(payload.guild_id)
+    if guild is None:
+        logger.warning("Could not resolve guild for reaction payload guild_id=%s", payload.guild_id)
+        return None
+
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(payload.channel_id)
+        except Exception:
+            logger.exception("Could not fetch channel for reaction payload channel_id=%s", payload.channel_id)
+            return None
+
+    member = payload.member
+    if member is None:
+        member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            logger.exception("Could not fetch member for reaction payload user_id=%s", payload.user_id)
+            return None
+
+    return SimpleNamespace(guild=guild, channel=channel, author=member)
+
+
+async def run_reaction_voice_loop(context, duration_seconds: int) -> None:
+    try:
+        await handle_record_or_talk(context, duration_seconds, mode="talk")
+    finally:
+        if context.guild:
+            REACTION_RECORDING_TASKS.pop(context.guild.id, None)
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if client.user and payload.user_id == client.user.id:
+        return
+    if not is_matching_control_reaction(payload):
+        return
+
+    context = await fetch_reaction_context(payload)
+    if context is None:
+        return
+
+    if context.guild.id in REACTION_RECORDING_TASKS:
+        logger.info(
+            "Ignoring reaction start because a reaction-controlled recording task is already active guild=%s user=%s",
+            context.guild.id,
+            payload.user_id,
+        )
+        return
+
+    if context.guild.id in ACTIVE_RECORDINGS:
+        logger.info(
+            "Ignoring reaction start because a recording is already active guild=%s user=%s",
+            context.guild.id,
+            payload.user_id,
+        )
+        return
+
+    logger.info(
+        "Starting reaction-controlled voice loop guild=%s user=%s channel=%s emoji=%s duration=%s",
+        context.guild.id,
+        payload.user_id,
+        context.channel.id,
+        payload.emoji,
+        reaction_record_seconds,
+    )
+    REACTION_RECORDING_TASKS[context.guild.id] = asyncio.create_task(
+        run_reaction_voice_loop(context, reaction_record_seconds)
+    )
+
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
+    if client.user and payload.user_id == client.user.id:
+        return
+    if not is_matching_control_reaction(payload):
+        return
+    if not payload.guild_id:
+        return
+
+    session = ACTIVE_RECORDINGS.get(payload.guild_id)
+    if not session:
+        logger.info(
+            "Ignoring reaction stop because no recording is active guild=%s user=%s",
+            payload.guild_id,
+            payload.user_id,
+        )
+        return
+
+    if session.get("target_user_id") != payload.user_id:
+        logger.info(
+            "Ignoring reaction stop from non-owner guild=%s owner=%s remover=%s",
+            payload.guild_id,
+            session.get("target_user_id"),
+            payload.user_id,
+        )
+        return
+
+    logger.info(
+        "Stopping reaction-controlled recording guild=%s user=%s emoji=%s",
+        payload.guild_id,
+        payload.user_id,
+        payload.emoji,
+    )
+    stop_active_recording(payload.guild_id)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ Phase 3 starter adds:
 
 - `!record [seconds]` to capture voice-channel audio and transcribe it with Whisper
 - `!talk [seconds]` to record, transcribe, ask Ollama, and speak the reply back into voice
+- optional reaction control on a pinned message to start on react and stop on unreact
 
 ## Quick start
 
@@ -75,7 +76,11 @@ Phase 3 starter adds:
 - `OLLAMA_MODEL`: optional, defaults to `llama3.2`
 - `OLLAMA_BASE_URL`: optional, defaults to `http://127.0.0.1:11434`
 - `BOT_SYSTEM_PROMPT`: optional full system prompt template for Ollama. Supports `{bot_name}`, `{guild_name}`, `{channel_name}`, and `{user_name}`
-- `BOT_ALLOWED_CHANNEL_ID`: optional, only respond in that channel when set
+- `BOT_TEXT_CHANNEL_ID`: optional text channel ID for commands, transcripts, and replies
+- `BOT_VOICE_CHANNEL_ID`: optional voice channel ID for join/talk features
+- `BOT_REACTION_MESSAGE_ID`: optional message ID to use for reaction-based voice control
+- `BOT_REACTION_EMOJI`: optional control emoji for the reaction trigger, defaults to `🎙️`
+- `BOT_REACTION_RECORD_SECONDS`: optional max runtime for reaction-based recording before timeout, defaults to `600`
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
 - `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`
@@ -88,4 +93,5 @@ Backward-compatible aliases still work:
 
 - `DISCORD_ECHO_TOKEN`
 - `ECHO_SYSTEM_PROMPT`
+- `BOT_ALLOWED_CHANNEL_ID`
 - `ECHO_CHAMBER_CHANNEL_ID`
