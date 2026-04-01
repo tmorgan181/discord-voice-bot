@@ -2,3 +2,7 @@ discord.py[voice]==2.7.1
 requests==2.31.0
 python-dotenv==1.0.1
 pyttsx3==2.98
+git+https://github.com/rdphillips7/discord-ext-voice-recv.git@6b9fb95
+davey==0.1.5
+faster-whisper==1.2.1
+SpeechRecognition==3.15.2

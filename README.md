@@ -14,6 +14,10 @@ Phase 2 starter adds:
 - `!clear` to bulk-delete recent channel messages
 - automatic voice playback of each `!ask` response after the text reply
 
+Phase 3 starter adds:
+
+- `!record [seconds]` to capture voice-channel audio and transcribe it with Whisper
+
 ## Quick start
 
 1. Create a virtual environment if you want one:
@@ -56,6 +60,8 @@ Phase 2 starter adds:
 - The bot must have permission to connect and speak in the target voice channel.
 - On `!ask`, the bot will join your current voice channel automatically if needed.
 - Runtime errors and voice connection retries are written to a timestamped file in `logs/`.
+- `!record` captures speech from the current voice channel for up to 30 seconds using `SpeechRecognitionSink`.
+- The receive stack is still experimental upstream, so live voice recording may degrade or corrupt audio even on the latest published packages.
 
 ## Discord setup notes
 
@@ -71,5 +77,8 @@ Phase 2 starter adds:
 - `ECHO_CHAMBER_CHANNEL_ID`: optional, only respond in that channel when set
 - `ENABLE_CONVERSATION_LOGGING`: optional, defaults to `false`
 - `CONVERSATION_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped JSON file per run
+- `RECORDINGS_DIR`: optional directory for saved voice recordings, defaults to `recordings`
+- `WHISPER_MODEL`: optional, defaults to `base.en`
+- `WHISPER_AUDIO_GAIN`: optional gain multiplier applied before transcription, defaults to `3.0`
 - `TTS_AUDIO_DIR`: optional, defaults to `generated_audio`
 - `RUNTIME_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped log file per run

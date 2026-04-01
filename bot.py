@@ -1,15 +1,24 @@
 import asyncio
+import array
+import io
 import json
 import logging
+import math
 import os
 import uuid
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
+from discord.opus import OpusError
 import pyttsx3
 import requests
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+from discord.ext import voice_recv
+from discord.ext.voice_recv import opus as voice_recv_opus
+from discord.ext.voice_recv.extras.speechrecognition import SpeechRecognitionSink
 
 try:
     import davey  # type: ignore
@@ -22,16 +31,25 @@ DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 MAX_DISCORD_MESSAGE_LEN = 1900
 DEFAULT_CONVERSATION_LOG_DIR = Path("conversations")
 DEFAULT_AUDIO_DIR = Path("generated_audio")
+DEFAULT_RECORDINGS_DIR = Path("recordings")
 DEFAULT_RUNTIME_LOG_DIR = Path("logs")
 VOICE_CONNECT_RETRIES = 3
 VOICE_RETRY_DELAY_SECONDS = 2
 VOICE_HEALTH_LOG_INTERVAL_SECONDS = 30
 DEFAULT_CLEAR_COUNT = 25
 MAX_CLEAR_COUNT = 100
+DEFAULT_RECORD_SECONDS = 10
+MAX_RECORD_SECONDS = 30
+DEFAULT_AUDIO_GAIN = 3.0
 FFMPEG_SILENCE_INPUT = "anullsrc=r=48000:cl=stereo"
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SESSION_RUNTIME_LOG_PATH: Path | None = None
 SESSION_CONVERSATION_LOG_PATH: Path | None = None
+WHISPER_MODEL_INSTANCE: WhisperModel | None = None
+ACTIVE_RECORDINGS: dict[int, dict] = {}
+VOICE_RECV_PATCHED = False
+ACTIVE_RECORDING_SSRCS: set[int] = set()
+CORRUPT_PACKET_COUNTS: dict[int, int] = {}
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -106,6 +124,44 @@ def log_voice_backend_status() -> None:
         logger.warning("python-davey is not installed; Discord voice playback will not work.")
         return
     logger.info("Voice backend ready with python-davey %s", getattr(davey, "__version__", "unknown"))
+
+
+def log_phase3_backend_status() -> None:
+    logger.info(
+        "Phase 3 dependencies ready: voice_recv=%s faster_whisper=%s speech_sink=%s",
+        getattr(voice_recv, "__version__", "unknown"),
+        getattr(WhisperModel, "__module__", "faster_whisper"),
+        SpeechRecognitionSink.__name__,
+    )
+
+
+def patch_voice_recv_decoder() -> None:
+    global VOICE_RECV_PATCHED
+    if VOICE_RECV_PATCHED:
+        return
+
+    original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
+    silence_frame = b"\x00" * voice_recv_opus.Decoder.SAMPLE_SIZE * voice_recv_opus.Decoder.SAMPLES_PER_FRAME
+
+    def safe_decode_packet(self, packet):
+        try:
+            return original_decode_packet(self, packet)
+        except OpusError as exc:
+            ssrc = getattr(packet, "ssrc", None)
+            if ssrc in ACTIVE_RECORDING_SSRCS:
+                CORRUPT_PACKET_COUNTS[ssrc] = CORRUPT_PACKET_COUNTS.get(ssrc, 0) + 1
+            else:
+                logger.warning(
+                    "Ignoring corrupt Opus packet outside active recording ssrc=%s sequence=%s error=%s",
+                    ssrc,
+                    getattr(packet, "sequence", None),
+                    exc,
+                )
+            return packet, silence_frame
+
+    voice_recv_opus.PacketDecoder._decode_packet = safe_decode_packet
+    VOICE_RECV_PATCHED = True
+    logger.info("Patched voice receive decoder to tolerate corrupt Opus packets")
 
 
 def ask_ollama(prompt: str) -> str:
@@ -220,6 +276,108 @@ def synthesize_tts_to_file(text: str) -> Path:
 
     logger.info("Generated TTS audio at %s", audio_path)
     return audio_path
+
+
+def get_recordings_dir() -> Path:
+    configured = os.getenv("RECORDINGS_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    return DEFAULT_RECORDINGS_DIR
+
+
+def create_recording_path(target_user: discord.abc.User) -> Path:
+    recordings_dir = get_recordings_dir()
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    safe_user = str(target_user).replace(" ", "_").replace("#", "-")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return recordings_dir / f"recording-{timestamp}-{safe_user}.wav"
+
+
+def append_wav_frames(audio_bytes: bytes, pcm_chunks: list[bytes]) -> tuple[wave._wave_params, bytes]:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        params = reader.getparams()
+        frames = reader.readframes(reader.getnframes())
+    pcm_chunks.append(frames)
+    return params, frames
+
+
+def save_recording_wav(path: Path, params: wave._wave_params | None, pcm_chunks: list[bytes]) -> bool:
+    if params is None or not pcm_chunks:
+        return False
+
+    with wave.open(str(path), "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(b"".join(pcm_chunks))
+    return True
+
+
+def compute_pcm_rms(frames: bytes, sample_width: int) -> float:
+    if not frames:
+        return 0.0
+    if sample_width != 2:
+        return 0.0
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if not samples:
+        return 0.0
+
+    square_sum = sum(sample * sample for sample in samples)
+    return math.sqrt(square_sum / len(samples))
+
+
+def scale_pcm_frames(frames: bytes, sample_width: int, gain: float) -> bytes:
+    if not frames or gain == 1.0:
+        return frames
+    if sample_width != 2:
+        return frames
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    for index, sample in enumerate(samples):
+        scaled = int(sample * gain)
+        if scaled > 32767:
+            scaled = 32767
+        elif scaled < -32768:
+            scaled = -32768
+        samples[index] = scaled
+    return samples.tobytes()
+
+
+def amplify_wav_bytes(audio_bytes: bytes) -> tuple[bytes, float]:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        params = reader.getparams()
+        frames = reader.readframes(reader.getnframes())
+
+    rms = compute_pcm_rms(frames, params.sampwidth)
+    gain = float(os.getenv("WHISPER_AUDIO_GAIN", str(DEFAULT_AUDIO_GAIN)))
+    boosted_frames = scale_pcm_frames(frames, params.sampwidth, gain)
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setparams(params)
+        writer.writeframes(boosted_frames)
+    return buffer.getvalue(), float(rms)
+
+
+def get_whisper_model() -> WhisperModel:
+    global WHISPER_MODEL_INSTANCE
+    if WHISPER_MODEL_INSTANCE is None:
+        model_name = os.getenv("WHISPER_MODEL", "tiny.en")
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+        logger.info(
+            "Loading Whisper model name=%s device=%s compute_type=%s",
+            model_name,
+            device,
+            compute_type,
+        )
+        WHISPER_MODEL_INSTANCE = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+        )
+    return WHISPER_MODEL_INSTANCE
 
 
 async def send_error(channel: discord.abc.Messageable, text: str) -> None:
@@ -372,6 +530,40 @@ def stop_idle_keepalive(voice_client: discord.VoiceClient) -> None:
         voice_client.stop()
 
 
+def stop_voice_capture(voice_client: discord.VoiceClient) -> None:
+    if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
+        logger.info(
+            "Stopping active voice capture in channel %s",
+            voice_client.channel.id if voice_client.channel else None,
+        )
+        voice_client.stop_listening()
+
+
+def is_recoverable_capture_error(error: object) -> bool:
+    if error is None:
+        return False
+    text = str(error).strip().lower()
+    return "corrupted stream" in text
+
+
+def stop_active_recording(guild_id: int) -> bool:
+    session = ACTIVE_RECORDINGS.get(guild_id)
+    if not session:
+        return False
+
+    stop_event = session.get("stop_event")
+    voice_client = session.get("voice_client")
+    logger.info("Stop requested for active recording in guild=%s", guild_id)
+
+    if stop_event is not None and not stop_event.is_set():
+        stop_event.set()
+
+    if isinstance(voice_client, discord.VoiceClient):
+        stop_voice_capture(voice_client)
+
+    return True
+
+
 async def voice_health_monitor() -> None:
     await client.wait_until_ready()
     while not client.is_closed():
@@ -398,7 +590,7 @@ async def voice_health_monitor() -> None:
 
 async def connect_voice_with_retries(
     guild: discord.Guild, target_channel: discord.VoiceChannel
-) -> discord.VoiceClient:
+) -> voice_recv.VoiceRecvClient:
     last_error: Exception | None = None
 
     for attempt in range(1, VOICE_CONNECT_RETRIES + 1):
@@ -415,6 +607,29 @@ async def connect_voice_with_retries(
 
             if voice_client and voice_client.channel and voice_client.channel.id == target_channel.id:
                 if voice_client.is_connected():
+                    if not isinstance(voice_client, voice_recv.VoiceRecvClient):
+                        logger.info("Existing voice client is not VoiceRecvClient; resetting it")
+                        await reset_voice_client(guild)
+                    else:
+                        logger.info(
+                            "Reusing existing voice connection in %s for guild %s",
+                            target_channel.name,
+                            guild.id,
+                        )
+                        start_idle_keepalive(voice_client)
+                        return voice_client
+                if guild.voice_client:
+                    await reset_voice_client(guild)
+                voice_client = guild.voice_client
+
+            if voice_client:
+                if not isinstance(voice_client, voice_recv.VoiceRecvClient):
+                    logger.info("Resetting non-receive voice client before move/connect")
+                    await reset_voice_client(guild)
+                    voice_client = guild.voice_client
+
+            if voice_client and voice_client.channel and voice_client.channel.id == target_channel.id:
+                if voice_client.is_connected():
                     logger.info(
                         "Reusing existing voice connection in %s for guild %s",
                         target_channel.name,
@@ -422,7 +637,6 @@ async def connect_voice_with_retries(
                     )
                     start_idle_keepalive(voice_client)
                     return voice_client
-                await reset_voice_client(guild)
 
             if voice_client:
                 logger.info(
@@ -439,16 +653,18 @@ async def connect_voice_with_retries(
                 raise discord.ClientException("Voice client moved but did not become connected.")
 
             logger.info(
-                "Connecting to voice channel %s in guild %s (attempt %s/%s)",
+                "Connecting to voice channel %s in guild %s (attempt %s/%s, self_deaf=%s)",
                 target_channel.name,
                 guild.id,
                 attempt,
                 VOICE_CONNECT_RETRIES,
+                False,
             )
             new_voice_client = await target_channel.connect(
                 reconnect=True,
                 timeout=20.0,
-                self_deaf=True,
+                self_deaf=False,
+                cls=voice_recv.VoiceRecvClient,
             )
             if new_voice_client.is_connected():
                 start_idle_keepalive(new_voice_client)
@@ -472,7 +688,7 @@ async def connect_voice_with_retries(
     )
 
 
-async def ensure_voice_client(message: discord.Message) -> discord.VoiceClient | None:
+async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvClient | None:
     if not message.guild:
         await send_error(message.channel, "Voice features only work inside a server.")
         return None
@@ -522,9 +738,184 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     logger.info("Started voice playback in channel %s", voice_client.channel.id)
 
 
+async def run_speech_recognition_capture(
+    voice_client: voice_recv.VoiceRecvClient,
+    duration_seconds: int,
+    guild_id: int,
+    target_user: discord.abc.User,
+) -> str:
+    logger.info(
+        "Starting speech recognition capture duration=%ss channel=%s target_user=%s",
+        duration_seconds,
+        voice_client.channel.id if voice_client.channel else None,
+        target_user,
+    )
+
+    stop_idle_keepalive(voice_client)
+    stop_voice_capture(voice_client)
+
+    finished = asyncio.get_running_loop().create_future()
+    stop_event = asyncio.Event()
+    transcript_parts: list[str] = []
+    recognition_errors: list[str] = []
+    recording_path = create_recording_path(target_user)
+    recording_params: wave._wave_params | None = None
+    recording_pcm_chunks: list[bytes] = []
+    tracked_ssrcs = {
+        ssrc
+        for ssrc, user_id in voice_client._ssrc_to_id.items()
+        if user_id == target_user.id
+    }
+    logger.info(
+        "Speech recognition capture targeting user_id=%s tracked_ssrcs=%s all_ssrc_map=%s",
+        target_user.id,
+        sorted(tracked_ssrcs),
+        dict(voice_client._ssrc_to_id),
+    )
+    ACTIVE_RECORDING_SSRCS.update(tracked_ssrcs)
+    for ssrc in tracked_ssrcs:
+        CORRUPT_PACKET_COUNTS.pop(ssrc, None)
+
+    def process_cb(recognizer, audio, user):
+        try:
+            if user is None or user.id != target_user.id:
+                logger.info(
+                    "Ignoring speech chunk for non-target user=%s target_user_id=%s",
+                    user,
+                    target_user.id,
+                )
+                return None
+            audio_data = audio.get_wav_data()
+            nonlocal recording_params
+            recording_params, _ = append_wav_frames(audio_data, recording_pcm_chunks)
+            boosted_audio_data, rms = amplify_wav_bytes(audio_data)
+            model = get_whisper_model()
+            segments, info = model.transcribe(
+                io.BytesIO(boosted_audio_data),
+                beam_size=1,
+                vad_filter=False,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            logger.info(
+                "Speech recognition process callback completed user=%s target_user_id=%s language=%s duration=%s chars=%s rms=%s",
+                user,
+                target_user.id,
+                getattr(info, "language", None),
+                getattr(info, "duration", None),
+                len(text),
+                rms,
+            )
+            return text or None
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            recognition_errors.append(message)
+            logger.exception("Speech recognition process callback failed for user=%s", user)
+            return None
+
+    def text_cb(user, text):
+        if user is None or user.id != target_user.id:
+            logger.info(
+                "Ignoring speech text for non-target user=%s target_user_id=%s text=%s",
+                user,
+                target_user.id,
+                text,
+            )
+            return
+        logger.info(
+            "SpeechRecognitionSink text user=%s target_user_id=%s text=%s",
+            user,
+            target_user.id,
+            text,
+        )
+        if text and text.strip():
+            transcript_parts.append(text.strip())
+
+    sink = SpeechRecognitionSink(
+        process_cb=process_cb,
+        text_cb=text_cb,
+        default_recognizer="whisper",
+        phrase_time_limit=duration_seconds,
+        ignore_silence_packets=True,
+    )
+    ACTIVE_RECORDINGS[guild_id] = {
+        "voice_client": voice_client,
+        "stop_event": stop_event,
+        "tracked_ssrcs": tracked_ssrcs,
+        "mode": "speechrecognition",
+        "target_user_id": target_user.id,
+    }
+
+    def after_recording(exc: Exception | None) -> None:
+        try:
+            sink.cleanup()
+        except Exception:
+            logger.exception("Failed cleaning up speech recognition sink")
+
+        if exc:
+            logger.exception("Speech recognition callback reported an error", exc_info=exc)
+        if not finished.done():
+            finished.set_result(exc)
+
+    try:
+        voice_client.listen(sink, after=after_recording)
+    except Exception:
+        logger.exception("Failed to start speech recognition capture")
+        try:
+            sink.cleanup()
+        except Exception:
+            logger.exception("Failed cleaning up speech recognition sink after startup failure")
+        raise
+
+    try:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=duration_seconds)
+            logger.info("Speech recognition capture stopped early for guild=%s", guild_id)
+        except asyncio.TimeoutError:
+            logger.info("Speech recognition capture completed full duration for guild=%s", guild_id)
+    finally:
+        stop_voice_capture(voice_client)
+        callback_error = await finished
+        if voice_client.is_connected():
+            start_idle_keepalive(voice_client)
+        session = ACTIVE_RECORDINGS.pop(guild_id, None)
+        tracked_ssrcs = session.get("tracked_ssrcs", set()) if session else set()
+        total_corrupt_packets = 0
+        for ssrc in tracked_ssrcs:
+            ACTIVE_RECORDING_SSRCS.discard(ssrc)
+            total_corrupt_packets += CORRUPT_PACKET_COUNTS.pop(ssrc, 0)
+        if total_corrupt_packets:
+            logger.warning(
+                "Speech recognition capture encountered %s corrupt Opus packets across %s SSRC(s) for target_user_id=%s",
+                total_corrupt_packets,
+                len(tracked_ssrcs),
+                session.get("target_user_id") if session else None,
+            )
+        if callback_error and not is_recoverable_capture_error(callback_error):
+            raise RuntimeError(f"Speech recognition capture ended with an error: {callback_error}")
+        if recognition_errors and not transcript_parts:
+            raise RuntimeError(f"Speech recognizer failed: {recognition_errors[-1]}")
+
+    if save_recording_wav(recording_path, recording_params, recording_pcm_chunks):
+        logger.info(
+            "Saved recording to %s size_bytes=%s chunks=%s target_user_id=%s",
+            recording_path,
+            recording_path.stat().st_size,
+            len(recording_pcm_chunks),
+            target_user.id,
+        )
+    else:
+        logger.warning("No recording audio was saved for target_user_id=%s", target_user.id)
+
+    transcript = " ".join(transcript_parts).strip()
+    logger.info("Speech recognition capture produced chars=%s", len(transcript))
+    return transcript
+
+
 load_dotenv()
 logger = setup_logging()
 log_voice_backend_status()
+log_phase3_backend_status()
+patch_voice_recv_decoder()
 
 token = get_required_env("DISCORD_ECHO_TOKEN", "DISCORD_BOT_TOKEN")
 allowed_channel_id = os.getenv("ECHO_CHAMBER_CHANNEL_ID")
@@ -631,6 +1022,107 @@ async def on_message(message: discord.Message) -> None:
 
     if command == "!clear":
         await handle_clear_command(message, content)
+        return
+
+    if command == "!record":
+        duration_seconds = DEFAULT_RECORD_SECONDS
+        if len(parts) == 2:
+            try:
+                duration_seconds = int(parts[1])
+            except ValueError:
+                await send_error(
+                    message.channel,
+                    f"Usage: `!record` or `!record {DEFAULT_RECORD_SECONDS}`",
+                )
+                return
+
+        if duration_seconds < 1 or duration_seconds > MAX_RECORD_SECONDS:
+            await send_error(
+                message.channel,
+                f"`!record` accepts a number between 1 and {MAX_RECORD_SECONDS} seconds.",
+            )
+            return
+
+        try:
+            voice_client = await ensure_voice_client(message)
+            if voice_client is None:
+                return
+            logger.info(
+                "Record command accepted guild=%s channel=%s user=%s duration=%s",
+                message.guild.id if message.guild else None,
+                message.channel.id,
+                message.author.id,
+                duration_seconds,
+            )
+            if message.guild and message.guild.id in ACTIVE_RECORDINGS:
+                await send_error(
+                    message.channel,
+                    "A recording is already in progress. Use `!stop` first if you want to end it early.",
+                )
+                return
+            await message.channel.send(f"Recording for {duration_seconds} seconds...")
+            async with message.channel.typing():
+                transcript = await run_speech_recognition_capture(
+                    voice_client,
+                    duration_seconds,
+                    message.guild.id,
+                    message.author,
+                )
+        except discord.ClientException:
+            logger.exception("Discord voice error during recording")
+            await send_error(
+                message.channel,
+                "I couldn't access the voice channel for recording. Try `!join` again first.",
+            )
+            return
+        except RuntimeError as exc:
+            logger.exception("Speech recognition runtime check failed")
+            await send_error(
+                message.channel,
+                f"Recording or speech recognition failed: {exc}",
+            )
+            return
+        except Exception:
+            logger.exception("Recording or speech recognition failed")
+            await send_error(
+                message.channel,
+                "Recording or speech recognition failed. Check the runtime log for details.",
+            )
+            return
+
+        if not transcript:
+            logger.info("Speech recognition completed with no detectable speech")
+            transcript = "[No speech detected]"
+        else:
+            logger.info(
+                "Speech recognition completed successfully chars=%s",
+                len(transcript),
+            )
+
+        await message.channel.send(f"Transcript: {transcript}")
+        return
+
+    if command == "!stop":
+        stopped_anything = False
+
+        if message.guild and stop_active_recording(message.guild.id):
+            stopped_anything = True
+
+        if message.guild and message.guild.voice_client and message.guild.voice_client.is_playing():
+            logger.info(
+                "Stop requested for active playback in guild=%s state=%s",
+                message.guild.id,
+                voice_state_snapshot(message.guild.voice_client),
+            )
+            stop_idle_keepalive(message.guild.voice_client)
+            if message.guild.voice_client.is_playing():
+                message.guild.voice_client.stop()
+            if message.guild.voice_client.is_connected():
+                start_idle_keepalive(message.guild.voice_client)
+            stopped_anything = True
+
+        if not stopped_anything:
+            await send_error(message.channel, "There is no active recording or playback to stop.")
         return
 
     if command != "!ask":
