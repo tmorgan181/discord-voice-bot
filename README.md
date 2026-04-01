@@ -64,7 +64,7 @@ Phase 3 starter adds:
 - The bot must have permission to connect and speak in the target voice channel.
 - On `!say`, the bot will join your current voice channel automatically if needed.
 - `!join` only joins voice.
-- `!talk` starts hands-free listening, and Echo will submit an utterance after roughly 1.5 seconds of silence.
+- `!talk` starts hands-free listening, and Chung will submit an utterance after roughly 1.5 seconds of silence.
 - `!stop` stops either a timed recording or the hands-free listener.
 - Runtime errors and voice connection retries are written to a timestamped file in `logs/`.
 - `!record` captures speech from the current voice channel for up to 30 seconds using `SpeechRecognitionSink`.
@@ -107,7 +107,7 @@ Phase 3 starter adds:
 - `TTS_AUDIO_DIR`: optional, defaults to `generated_audio`
 - `RUNTIME_LOG_PATH`: optional file or directory. If you give a directory, the bot creates a timestamped log file per run
 
-Backward-compatible aliases still work:
+Backward-compatible legacy aliases from the earlier Echo setup still work:
 
 - `DISCORD_ECHO_TOKEN`
 - `ECHO_SYSTEM_PROMPT`
