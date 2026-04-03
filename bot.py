@@ -1675,8 +1675,8 @@ def build_enhance_text(content: str) -> str:
     )
 
 
-def resolve_credits_cast(context) -> list[str]:
-    members: list[str] = []
+def resolve_credits_cast(context) -> list[tuple[int | None, str]]:
+    members: list[tuple[int | None, str]] = []
     guild = getattr(context, "guild", None)
     author = getattr(context, "author", None)
     voice_state = getattr(author, "voice", None)
@@ -1691,11 +1691,11 @@ def resolve_credits_cast(context) -> list[str]:
         for member in voice_channel.members:
             if member.bot:
                 continue
-            members.append(member.display_name)
+            members.append((member.id, member.display_name))
 
     if not members and author is not None:
         display_name = getattr(author, "display_name", str(author))
-        members.append(display_name)
+        members.append((getattr(author, "id", None), display_name))
 
     return members[:8]
 
@@ -1723,9 +1723,11 @@ def build_roll_credits_text(context) -> str:
     randomized_roles = roles[:]
     random.shuffle(randomized_roles)
     credit_lines = ["## Roll Credits", ""]
-    for index, name in enumerate(cast):
+    for index, (member_id, name) in enumerate(cast):
         role = randomized_roles[index % len(randomized_roles)]
-        credit_lines.append(f"{name} as {role}")
+        bonk_total = BONK_COUNTS.get(member_id, 0) if member_id is not None else 0
+        bonk_suffix = f" | Bonks: {bonk_total}" if bonk_total else ""
+        credit_lines.append(f"{name} as {role}{bonk_suffix}")
     credit_lines.append("")
     credit_lines.append(random.choice(taglines))
     return "\n".join(credit_lines)
