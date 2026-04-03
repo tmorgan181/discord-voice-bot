@@ -1,5 +1,6 @@
 import asyncio
 import array
+import difflib
 import io
 import json
 import logging
@@ -81,6 +82,7 @@ AUTO_LISTEN_SESSIONS: dict[int, dict] = {}
 AUTO_LISTEN_ENABLED_GUILDS: set[int] = set()
 ACTIVE_TTS_PLAYBACKS: dict[int, dict] = {}
 PENDING_VOICE_EXIT_TASKS: dict[int, asyncio.Task] = {}
+BONK_COUNTS: dict[int, int] = defaultdict(int)
 
 COLOR_RESET = "\033[0m"
 COLOR_DIM = "\033[2m"
@@ -90,6 +92,30 @@ COLOR_YELLOW = "\033[33m"
 COLOR_BLUE = "\033[34m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_CYAN = "\033[36m"
+
+BARREL_ROLL_ASCII = """\
+      __|__
+--o--(_)--o--
+    / ^ \\
+
+           / v \\
+      --o--(_)--o--
+         __|__
+
+             __|__//
+         --o--(_)--o--
+             / ^ \\
+"""
+
+PRESS_F_ASCII = """\
+      ___________
+     /           \\
+    /   R.I.P.    \\
+   /    Respect    \\
+  /_________________\\
+      ||       ||
+      ||       ||
+"""
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -832,6 +858,9 @@ async def handle_record_or_talk(
         return
 
     await context.channel.send(f"Heard: {transcript}")
+    if await maybe_handle_fun_trigger(context, transcript):
+        await ensure_auto_listen(context.guild, context.channel)
+        return
     await respond_with_ollama(
         context,
         transcript,
@@ -1293,6 +1322,239 @@ async def send_error(channel: discord.abc.Messageable, text: str) -> None:
         await channel.send(text)
     except Exception:
         logger.exception("Failed to send Discord error message: %s", text)
+
+
+async def send_fun_response(
+    context,
+    text: str,
+    *,
+    speak_text_reply: str | None = None,
+) -> None:
+    await context.channel.send(text)
+    spoken = speak_text_reply.strip() if speak_text_reply else ""
+    if not spoken:
+        return
+
+    guild = getattr(context, "guild", None)
+    author = getattr(context, "author", None)
+    has_active_voice = guild is not None and get_current_voice_client(guild) is not None
+    has_configured_voice = bool(get_env_value("BOT_VOICE_CHANNEL_ID"))
+    author_in_voice = isinstance(author, discord.Member) and author.voice is not None
+    if not (has_active_voice or has_configured_voice or author_in_voice):
+        return
+
+    try:
+        voice_client = await ensure_voice_client(context)
+        if voice_client is not None:
+            await speak_text(voice_client, spoken)
+    except discord.ClientException:
+        logger.exception("Discord voice error during fun trigger playback")
+    except Exception:
+        logger.exception("TTS playback failed during fun trigger")
+
+
+def build_enhance_text(content: str) -> str:
+    lowered = content.lower()
+    match = re.search(r"\benhance\b[:\s,-]*(.*)", content, flags=re.IGNORECASE)
+    subject = match.group(1).strip() if match else ""
+    if not subject:
+        if "pixel" in lowered:
+            subject = "the suspicious pixel"
+        elif "mystery" in lowered:
+            subject = "the mystery blob"
+        else:
+            subject = "the blurry evidence"
+
+    return (
+        "ENHANCING...\n"
+        f"Target: `{subject[:80]}`\n"
+        "Result: 37% more dramatic, 12% more legally questionable, and somehow still blurry."
+    )
+
+
+def resolve_credits_cast(context) -> list[str]:
+    members: list[str] = []
+    guild = getattr(context, "guild", None)
+    author = getattr(context, "author", None)
+    voice_state = getattr(author, "voice", None)
+    voice_channel = getattr(voice_state, "channel", None)
+
+    if voice_channel is None and guild is not None:
+        current_voice = get_current_voice_client(guild)
+        if current_voice is not None:
+            voice_channel = current_voice.channel
+
+    if voice_channel is not None:
+        for member in voice_channel.members:
+            if member.bot:
+                continue
+            members.append(member.display_name)
+
+    if not members and author is not None:
+        display_name = getattr(author, "display_name", str(author))
+        members.append(display_name)
+
+    return members[:8]
+
+
+def build_roll_credits_text(context) -> str:
+    roles = [
+        "Executive Producer of Bad Ideas",
+        "Lead Barrel Roll Coordinator",
+        "Bonk Safety Inspector",
+        "Chief Blur Enhancement Officer",
+        "Respect Operations Manager",
+        "Goblin Containment Specialist",
+        "Assistant to the Chaos Director",
+        "Whee Compliance Auditor",
+    ]
+    cast = resolve_credits_cast(context)
+    credit_lines = ["## Roll Credits", ""]
+    for index, name in enumerate(cast):
+        role = roles[index % len(roles)]
+        credit_lines.append(f"{name} as {role}")
+    credit_lines.append("")
+    credit_lines.append("No budgets were harmed in the making of this session.")
+    return "\n".join(credit_lines)
+
+
+def matches_fun_trigger(content: str) -> bool:
+    lowered = content.strip().lower()
+    return any(
+        (
+            "do a barrel roll" in lowered,
+            bool(re.search(r"\bpress\s+f\b", lowered)),
+            bool(re.search(r"\bbonk\b", lowered)),
+            bool(re.search(r"\benhance\b", lowered)),
+            "roll credits" in lowered,
+        )
+    )
+
+
+def resolve_bonk_target(context, content: str):
+    author = getattr(context, "author", None)
+    guild = getattr(context, "guild", None)
+    mentions = getattr(context, "mentions", None) or []
+
+    if mentions:
+        target = mentions[0]
+        return getattr(target, "id", None), getattr(target, "display_name", str(target))
+
+    match = re.search(r"\bbonk\b[\s,:-]*(.+)", content, flags=re.IGNORECASE)
+    if not match:
+        return getattr(author, "id", None), getattr(author, "display_name", str(author) if author else "someone")
+
+    raw_target = match.group(1).strip()
+    raw_target = re.sub(r"^[\"'`]+|[\"'`]+$", "", raw_target).strip()
+    raw_target = re.sub(r"^<@!?(\d+)>$", r"\1", raw_target)
+    if not raw_target:
+        return getattr(author, "id", None), getattr(author, "display_name", str(author) if author else "someone")
+
+    if guild is not None:
+        lowered_target = raw_target.casefold()
+        candidates: list[tuple[discord.Member, list[str]]] = []
+        for member in guild.members:
+            if member.bot:
+                continue
+            names = [
+                str(member.id),
+                member.display_name.casefold(),
+                member.name.casefold(),
+                str(member).casefold(),
+                getattr(member, "global_name", "") or "",
+                getattr(member, "nick", "") or "",
+            ]
+            normalized_names = [name.casefold() for name in names if name]
+            candidates.append((member, normalized_names))
+
+        for member, names in candidates:
+            if lowered_target in names:
+                return member.id, member.display_name
+
+        partial_matches: list[tuple[int, discord.Member]] = []
+        for member, names in candidates:
+            best_partial_score = 0
+            for name in names:
+                if lowered_target in name:
+                    best_partial_score = max(best_partial_score, len(lowered_target) * 100)
+                elif name in lowered_target:
+                    best_partial_score = max(best_partial_score, len(name) * 10)
+            if best_partial_score:
+                partial_matches.append((best_partial_score, member))
+
+        if partial_matches:
+            partial_matches.sort(key=lambda item: item[0], reverse=True)
+            best_member = partial_matches[0][1]
+            return best_member.id, best_member.display_name
+
+        fuzzy_matches: list[tuple[float, discord.Member]] = []
+        for member, names in candidates:
+            best_ratio = max((difflib.SequenceMatcher(None, lowered_target, name).ratio() for name in names), default=0.0)
+            if best_ratio >= 0.45:
+                fuzzy_matches.append((best_ratio, member))
+
+        if fuzzy_matches:
+            fuzzy_matches.sort(key=lambda item: item[0], reverse=True)
+            best_member = fuzzy_matches[0][1]
+            return best_member.id, best_member.display_name
+
+    return getattr(author, "id", None), getattr(author, "display_name", str(author) if author else "someone")
+
+
+async def maybe_handle_fun_trigger(context, content: str) -> bool:
+    stripped = content.strip()
+    lowered = stripped.lower()
+    author = getattr(context, "author", None)
+
+    if "do a barrel roll" in lowered:
+        await send_fun_response(
+            context,
+            f"```text\n{BARREL_ROLL_ASCII}\n```\nwheeeee",
+            speak_text_reply="wheeeee",
+        )
+        return True
+
+    if re.search(r"\bpress\s+f\b", lowered):
+        await send_fun_response(
+            context,
+            f"```text\n{PRESS_F_ASCII}\n```\nrespect has been paid",
+            speak_text_reply="respect has been paid",
+        )
+        return True
+
+    if re.search(r"\bbonk\b", lowered):
+        target_id, target_name = resolve_bonk_target(context, stripped)
+        if target_id is not None:
+            BONK_COUNTS[target_id] += 1
+            bonk_total = BONK_COUNTS[target_id]
+        else:
+            bonk_total = 1
+        bonk_message = f"*bonk* `{target_name}` has been bonked {bonk_total} time{'s' if bonk_total != 1 else ''}."
+        await send_fun_response(
+            context,
+            bonk_message,
+            speak_text_reply=f"bonk. {target_name} has been bonked {bonk_total} time{'s' if bonk_total != 1 else ''}.",
+        )
+        return True
+
+    if re.search(r"\benhance\b", lowered):
+        await send_fun_response(
+            context,
+            build_enhance_text(stripped),
+            speak_text_reply="enhancing. results remain extremely suspicious.",
+        )
+        return True
+
+    if "roll credits" in lowered:
+        credits_text = build_roll_credits_text(context)
+        await send_fun_response(
+            context,
+            credits_text,
+            speak_text_reply=credits_text.replace("## ", "").replace("`", ""),
+        )
+        return True
+
+    return False
 
 
 async def handle_clear_command(message: discord.Message, content: str) -> None:
@@ -2035,10 +2297,12 @@ async def process_auto_transcript(
     text: str,
     fallback_channel=None,
 ) -> None:
+    stripped_text = text.strip()
+
     async def resume_if_needed() -> None:
         await resume_hands_free_if_enabled(guild, fallback_channel)
 
-    if not text.strip():
+    if not stripped_text:
         await resume_if_needed()
         return
 
@@ -2048,24 +2312,26 @@ async def process_auto_transcript(
 
     session = AUTO_LISTEN_SESSIONS.get(guild.id)
     last_text = session.get("last_text", "") if session else ""
-    if text.strip().lower() == str(last_text).strip().lower():
+    if stripped_text.lower() == str(last_text).strip().lower():
         logger.info("Ignoring duplicate auto transcript guild=%s user=%s text=%s", guild.id, user.id, text)
         await resume_if_needed()
         return
 
-    distinct_words = extract_distinct_words(text)
-    min_distinct_words = get_auto_listen_min_distinct_words()
-    if len(distinct_words) < min_distinct_words:
-        logger.info(
-            "Ignoring short auto transcript guild=%s user=%s distinct_words=%s min_required=%s text=%s",
-            guild.id,
-            user.id,
-            len(distinct_words),
-            min_distinct_words,
-            text,
-        )
-        await resume_if_needed()
-        return
+    is_fun_trigger = matches_fun_trigger(stripped_text)
+    if not is_fun_trigger:
+        distinct_words = extract_distinct_words(text)
+        min_distinct_words = get_auto_listen_min_distinct_words()
+        if len(distinct_words) < min_distinct_words:
+            logger.info(
+                "Ignoring short auto transcript guild=%s user=%s distinct_words=%s min_required=%s text=%s",
+                guild.id,
+                user.id,
+                len(distinct_words),
+                min_distinct_words,
+                text,
+            )
+            await resume_if_needed()
+            return
 
     ignore_laughter, laughter_stats = should_ignore_laughter_transcript(text)
     if ignore_laughter:
@@ -2092,14 +2358,17 @@ async def process_auto_transcript(
 
     if session is not None:
         session["busy"] = True
-        session["last_text"] = text.strip()
+        session["last_text"] = stripped_text
     stop_auto_listen(guild.id)
     try:
-        await channel.send(f"Heard {getattr(user, 'display_name', user)}: {text.strip()}")
+        await channel.send(f"Heard {getattr(user, 'display_name', user)}: {stripped_text}")
         message_like = SimpleNamespace(guild=guild, channel=channel, author=user)
+        if await maybe_handle_fun_trigger(message_like, stripped_text):
+            await resume_if_needed()
+            return
         await respond_with_ollama(
             message_like,
-            text.strip(),
+            stripped_text,
             speak_reply=True,
             log_source="auto",
         )
@@ -2896,20 +3165,28 @@ async def on_message(message: discord.Message) -> None:
             await send_error(message.channel, "There is no active talk session, recording, or playback to stop.")
         return
 
-    if command != "!say":
+    if command == "!say":
+        question = content[4:].strip()
+        if not question:
+            await message.channel.send("Usage: `!say your message here`")
+            return
+
+        if await maybe_handle_fun_trigger(message, question):
+            return
+
+        await respond_with_ollama(
+            message,
+            question,
+            speak_reply=True,
+            log_source="text",
+        )
         return
 
-    question = content[4:].strip()
-    if not question:
-        await message.channel.send("Usage: `!say your message here`")
+    if command.startswith("!"):
         return
 
-    await respond_with_ollama(
-        message,
-        question,
-        speak_reply=True,
-        log_source="text",
-    )
+    if await maybe_handle_fun_trigger(message, content):
+        return
 
 
 def is_matching_control_reaction(payload: discord.RawReactionActionEvent) -> bool:
