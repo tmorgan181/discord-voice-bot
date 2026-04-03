@@ -1473,7 +1473,7 @@ def matches_fun_trigger(content: str) -> bool:
     return any(
         (
             bool(re.search(r"\bbarrel\b", lowered)),
-            bool(re.search(r"\b(?:press\s+f|f)\b", lowered)),
+            bool(re.search(r"\b(?:press\s+f|f|pay\s+respects?|respects?)\b", lowered)),
             bool(re.search(r"\b(?:bonk|vonk|wonk)\b", lowered)),
             bool(re.search(r"\benhance(d)?\b", lowered)),
             "roll credits" in lowered or "roll credit" in lowered or bool(re.search(r"\bcredits?\b", lowered)),
@@ -1564,7 +1564,7 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
         )
         return True
 
-    if re.search(r"\b(?:press\s+f|f)\b", lowered):
+    if re.search(r"\b(?:press\s+f|f|pay\s+respects?|respects?)\b", lowered):
         await send_fun_response(
             context,
             f"```text\n{PRESS_F_ASCII}\n```\nrespect has been paid",
