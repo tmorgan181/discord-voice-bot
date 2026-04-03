@@ -69,6 +69,7 @@ DEFAULT_MAX_AUDIO_GAIN = 6.0
 DEFAULT_WHISPER_MODEL = "base.en"
 DEFAULT_WHISPER_BEAM_SIZE = 1
 FFMPEG_SILENCE_INPUT = "anullsrc=r=48000:cl=stereo"
+TWENTY_QUESTIONS_MAX_TURNS = 20
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SESSION_RUNTIME_LOG_PATH: Path | None = None
 SESSION_CONVERSATION_LOG_PATH: Path | None = None
@@ -84,6 +85,9 @@ AUTO_LISTEN_ENABLED_GUILDS: set[int] = set()
 ACTIVE_TTS_PLAYBACKS: dict[int, dict] = {}
 PENDING_VOICE_EXIT_TASKS: dict[int, asyncio.Task] = {}
 BONK_COUNTS: dict[int, int] = defaultdict(int)
+ACTIVE_TWENTY_QUESTIONS: dict[int, dict] = {}
+LAST_TTS_BUSY_NOTICE_AT: dict[int, float] = {}
+TTS_BUSY_BYPASS_UNTIL: dict[int, float] = {}
 
 COLOR_RESET = "\033[0m"
 COLOR_DIM = "\033[2m"
@@ -565,6 +569,212 @@ def ask_ollama_with_context(message: discord.Message, prompt: str) -> str:
 
 def get_ollama_display_target() -> str:
     return os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+def build_twenty_questions_prompt(game: dict) -> str:
+    history = game.get("history", [])
+    turns_used = game.get("turns_used", 0)
+    remaining = max(0, TWENTY_QUESTIONS_MAX_TURNS - turns_used)
+    lines = [
+        "You are playing 20 Questions.",
+        "The user is thinking of a secret word or phrase.",
+        "You must ask concise yes/no questions, or make a direct guess when confident.",
+        f"You have {remaining} turns remaining out of {TWENTY_QUESTIONS_MAX_TURNS}.",
+        "Reply in exactly one of these formats:",
+        "QUESTION: <short yes/no question>",
+        "GUESS: <your guess>",
+        "Keep questions under 16 words and guesses under 10 words.",
+        "Do not include explanation or any extra text.",
+    ]
+    if history:
+        lines.append("Game history:")
+        for item in history[-40:]:
+            lines.append(f"{item['role']}: {item['content']}")
+    else:
+        lines.append("This is the first turn. Start broad and smart.")
+    if remaining <= 1:
+        lines.append("You should make a guess now.")
+    return "\n".join(lines)
+
+
+def ask_ollama_for_twenty_questions_turn(game: dict) -> tuple[str, str]:
+    response = ask_ollama(build_twenty_questions_prompt(game))
+    normalized = response.strip()
+    if normalized.upper().startswith("QUESTION:"):
+        content = normalized.split(":", 1)[1].strip()
+        return "question", content or "Is it a physical object?"
+    if normalized.upper().startswith("GUESS:"):
+        content = normalized.split(":", 1)[1].strip()
+        return "guess", content or "a rock"
+    if "?" in normalized:
+        return "question", normalized
+    return "guess", normalized or "a rock"
+
+
+def normalize_yes_no_answer(text: str) -> str | None:
+    raw_lowered = text.lower().strip()
+    if "don't know" in raw_lowered or "dont know" in raw_lowered or "not sure" in raw_lowered:
+        return "unknown"
+
+    lowered = re.sub(r"[^a-z\s]", " ", raw_lowered)
+    tokens = [token for token in lowered.split() if token]
+    if not tokens:
+        return None
+
+    positive = {"yes", "yep", "yeah", "yup", "correct", "right", "true", "sure", "affirmative"}
+    negative = {"no", "nope", "nah", "false", "incorrect", "wrong", "negative"}
+    maybe = {"maybe", "sometimes", "sorta", "kind", "kindof", "depends", "partly", "partially"}
+    unknown = {"unknown", "idk", "unsure"}
+
+    if any(token in positive for token in tokens):
+        return "yes"
+    if any(token in negative for token in tokens):
+        return "no"
+    if any(token in maybe for token in tokens):
+        return "maybe"
+    if "i" in tokens and "know" in tokens:
+        return "unknown"
+    if any(token in unknown for token in tokens):
+        return "unknown"
+    return None
+
+
+def is_twenty_questions_start_request(text: str) -> bool:
+    lowered = text.strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:20|twenty)\s+questions?\b",
+            lowered,
+        )
+    )
+
+
+def is_twenty_questions_end_request(text: str) -> bool:
+    lowered = text.strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"end(?:\s+of)?\s+(?:the\s+)?(?:game|again)"
+            r"|and\s+(?:the\s+)?game"
+            r"|stop\s+(?:the\s+)?game"
+            r"|quit\s+(?:the\s+)?game"
+            r")\b",
+            lowered,
+        )
+    )
+
+
+async def advance_twenty_questions_turn(context, game: dict) -> None:
+    turn_kind, content = await asyncio.to_thread(ask_ollama_for_twenty_questions_turn, game)
+    game["turns_used"] = game.get("turns_used", 0) + 1
+    game["awaiting"] = "guess_result" if turn_kind == "guess" else "answer"
+    game["last_turn_kind"] = turn_kind
+    game["last_bot_content"] = content
+    game.setdefault("history", []).append(
+        {
+            "role": "assistant",
+            "content": f"{turn_kind.upper()}: {content}",
+        }
+    )
+
+    if turn_kind == "guess":
+        reply = f"Guess {game['turns_used']}/{TWENTY_QUESTIONS_MAX_TURNS}: is it `{content}`?"
+        spoken = f"Guess {game['turns_used']}. Is it {content}?"
+    else:
+        reply = f"Question {game['turns_used']}/{TWENTY_QUESTIONS_MAX_TURNS}: {content}"
+        spoken = content
+    await send_fun_response(context, reply, speak_text_reply=spoken)
+
+
+async def start_twenty_questions(context) -> None:
+    guild = getattr(context, "guild", None)
+    if guild is None:
+        await send_error(context.channel, "20 Questions only works inside a server.")
+        return
+    existing = ACTIVE_TWENTY_QUESTIONS.get(guild.id)
+    if existing and existing.get("channel_id") == context.channel.id:
+        await context.channel.send("20 Questions is already running here. Use `!20q status` or `!20q stop`.")
+        return
+
+    ACTIVE_TWENTY_QUESTIONS[guild.id] = {
+        "channel_id": context.channel.id,
+        "host_user_id": getattr(getattr(context, "author", None), "id", None),
+        "turns_used": 0,
+        "awaiting": "answer",
+        "last_turn_kind": None,
+        "last_bot_content": None,
+        "history": [
+            {
+                "role": "system",
+                "content": "The player has started a new game and is thinking of a word or phrase.",
+            }
+        ],
+    }
+    await context.channel.send(
+        "Think of a word or phrase. Answer with `yes`, `no`, `maybe`, or `don't know`, and I'll try to get it in 20."
+    )
+    await advance_twenty_questions_turn(context, ACTIVE_TWENTY_QUESTIONS[guild.id])
+
+
+async def stop_twenty_questions(context, *, message: str | None = None) -> bool:
+    guild = getattr(context, "guild", None)
+    if guild is None:
+        return False
+    game = ACTIVE_TWENTY_QUESTIONS.pop(guild.id, None)
+    if game is None:
+        return False
+    if message:
+        await context.channel.send(message)
+    return True
+
+
+async def maybe_handle_twenty_questions_reply(context, content: str) -> bool:
+    guild = getattr(context, "guild", None)
+    if guild is None:
+        return False
+    game = ACTIVE_TWENTY_QUESTIONS.get(guild.id)
+    if game is None or game.get("channel_id") != context.channel.id:
+        return False
+
+    stripped = content.strip()
+    if not stripped:
+        return True
+
+    lowered = stripped.lower()
+    if lowered in {"!20q stop", "!20q end", "!20q quit"} or is_twenty_questions_end_request(lowered):
+        await stop_twenty_questions(context, message="20 Questions ended.")
+        return True
+
+    normalized = normalize_yes_no_answer(stripped)
+    if normalized is None:
+        await context.channel.send("20 Questions wants `yes`, `no`, `maybe`, or `don't know`.")
+        return True
+
+    last_turn_kind = game.get("last_turn_kind")
+    last_bot_content = game.get("last_bot_content") or ""
+    if last_turn_kind == "guess":
+        game.setdefault("history", []).append({"role": "user", "content": f"GUESS RESULT: {normalized}"})
+        if normalized == "yes":
+            turns_used = game.get("turns_used", 0)
+            await stop_twenty_questions(
+                context,
+                message=f"I win in {turns_used} turns. Suspiciously easy, honestly.",
+            )
+            return True
+        game.setdefault("history", []).append(
+            {"role": "system", "content": f"The guess `{last_bot_content}` was wrong."}
+        )
+    else:
+        game.setdefault("history", []).append(
+            {"role": "user", "content": f"ANSWER to `{last_bot_content}`: {normalized}"}
+        )
+
+    if game.get("turns_used", 0) >= TWENTY_QUESTIONS_MAX_TURNS:
+        await stop_twenty_questions(context, message="I'm out of turns. You win this round.")
+        return True
+
+    await advance_twenty_questions_turn(context, game)
+    return True
 
 
 class TunedSpeechRecognitionSink(SpeechRecognitionSink):
@@ -1325,6 +1535,41 @@ async def send_error(channel: discord.abc.Messageable, text: str) -> None:
         logger.exception("Failed to send Discord error message: %s", text)
 
 
+async def maybe_reject_message_during_tts(message: discord.Message, command: str) -> bool:
+    guild = message.guild
+    if guild is None:
+        return False
+
+    bypass_until = TTS_BUSY_BYPASS_UNTIL.get(guild.id, 0.0)
+    if time.monotonic() < bypass_until:
+        return False
+
+    playback = ACTIVE_TTS_PLAYBACKS.get(guild.id)
+    if not playback:
+        return False
+    if playback.get("interrupt_requested"):
+        return False
+
+    voice_client = playback.get("voice_client")
+    if not isinstance(voice_client, discord.VoiceClient):
+        return False
+    if not voice_client.is_connected():
+        return False
+    if is_idle_keepalive_active(voice_client):
+        return False
+
+    allowed_commands = {"!stop", "!leave", "!endtalk", "!stoptalk", "!talkoff"}
+    if command in allowed_commands:
+        return False
+
+    now = time.monotonic()
+    last_notice = LAST_TTS_BUSY_NOTICE_AT.get(guild.id, 0.0)
+    if now - last_notice >= 2.0:
+        LAST_TTS_BUSY_NOTICE_AT[guild.id] = now
+        await message.channel.send("I'm talking right now, so I'm ignoring new messages until the TTS finishes.")
+    return True
+
+
 async def send_fun_response(
     context,
     text: str,
@@ -1353,8 +1598,26 @@ async def send_fun_response(
             await speak_text(voice_client, spoken)
     except discord.ClientException:
         logger.exception("Discord voice error during fun trigger playback")
+        if guild is not None:
+            try:
+                await reset_voice_client(guild)
+                voice_client = await ensure_voice_client(context)
+                if voice_client is not None:
+                    await speak_text(voice_client, spoken)
+                    return
+            except Exception:
+                logger.exception("Voice recovery retry failed during fun trigger playback")
     except Exception:
         logger.exception("TTS playback failed during fun trigger")
+        if guild is not None:
+            try:
+                await reset_voice_client(guild)
+                voice_client = await ensure_voice_client(context)
+                if voice_client is not None:
+                    await speak_text(voice_client, spoken)
+                    return
+            except Exception:
+                logger.exception("Voice recovery retry failed after TTS playback error")
 
 
 def build_enhance_text(content: str) -> str:
@@ -1470,11 +1733,12 @@ def build_roll_credits_text(context) -> str:
 
 def matches_fun_trigger(content: str) -> bool:
     lowered = content.strip().lower()
+    normalized_single_word = re.sub(r"^[^\w]+|[^\w]+$", "", lowered)
     return any(
         (
             bool(re.search(r"\bbarrel\b", lowered)),
             bool(re.search(r"\b(?:press\s+f|f|pay\s+respects?|respects?)\b", lowered)),
-            bool(re.search(r"\b(?:bonk|vonk|wonk)\b", lowered)),
+            bool(re.search(r"\b(?:bonk|vonk|wonk)\b", lowered)) or normalized_single_word in {"back", "bank"},
             bool(re.search(r"\benhance(d)?\b", lowered)),
             "roll credits" in lowered or "roll credit" in lowered or bool(re.search(r"\bcredits?\b", lowered)),
         )
@@ -1490,7 +1754,7 @@ def resolve_bonk_target(context, content: str):
         target = mentions[0]
         return getattr(target, "id", None), getattr(target, "display_name", str(target))
 
-    match = re.search(r"\b(?:bonk|vonk|wonk)\b[\s,:-]*(.+)", content, flags=re.IGNORECASE)
+    match = re.search(r"\b(?:bonk|vonk|wonk|back|bank)\b[\s,:-]*(.+)", content, flags=re.IGNORECASE)
     if not match:
         return getattr(author, "id", None), getattr(author, "display_name", str(author) if author else "someone")
 
@@ -1554,6 +1818,7 @@ def resolve_bonk_target(context, content: str):
 async def maybe_handle_fun_trigger(context, content: str) -> bool:
     stripped = content.strip()
     lowered = stripped.lower()
+    normalized_single_word = re.sub(r"^[^\w]+|[^\w]+$", "", lowered)
     author = getattr(context, "author", None)
 
     if re.search(r"\bbarrel\b", lowered):
@@ -1572,7 +1837,7 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
         )
         return True
 
-    if re.search(r"\b(?:bonk|vonk|wonk)\b", lowered):
+    if re.search(r"\b(?:bonk|vonk|wonk)\b", lowered) or normalized_single_word in {"back", "bank"}:
         target_id, target_name = resolve_bonk_target(context, stripped)
         if target_id is not None:
             BONK_COUNTS[target_id] += 1
@@ -2158,6 +2423,8 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     audio_path = await asyncio.to_thread(synthesize_tts_to_file, text)
 
     def cleanup(error: Exception | None) -> None:
+        if guild_id is not None:
+            ACTIVE_TTS_PLAYBACKS.pop(guild_id, None)
         if error:
             logger.exception("Voice playback error", exc_info=error)
         setattr(voice_client, "_idle_keepalive_active", False)
@@ -2200,8 +2467,24 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
     if voice_client.is_playing():
         stop_idle_keepalive(voice_client)
 
+    if guild_id is not None:
+        ACTIVE_TTS_PLAYBACKS[guild_id] = {
+            "voice_client": voice_client,
+            "text": text,
+            "interrupt_requested": False,
+        }
+
     source = discord.FFmpegPCMAudio(str(audio_path))
-    voice_client.play(source, after=cleanup)
+    try:
+        voice_client.play(source, after=cleanup)
+    except Exception:
+        if guild_id is not None:
+            ACTIVE_TTS_PLAYBACKS.pop(guild_id, None)
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not delete temporary audio file %s after playback start failure", audio_path)
+        raise
     logger.info("Started voice playback in channel %s", voice_client.channel.id)
 
 
@@ -2413,6 +2696,19 @@ async def process_auto_transcript(
     try:
         await channel.send(f"Heard {getattr(user, 'display_name', user)}: {stripped_text}")
         message_like = SimpleNamespace(guild=guild, channel=channel, author=user)
+        if is_twenty_questions_start_request(stripped_text):
+            await start_twenty_questions(message_like)
+            return
+        if is_twenty_questions_end_request(stripped_text):
+            if not await stop_twenty_questions(message_like, message="20 Questions ended."):
+                await channel.send("There isn't an active 20 Questions game right now.")
+            await resume_if_needed()
+            return
+        if await maybe_handle_twenty_questions_reply(message_like, stripped_text):
+            voice_client = get_current_voice_client(guild)
+            if not (voice_client and voice_client.is_connected() and voice_client.is_playing()):
+                await resume_if_needed()
+            return
         if await maybe_handle_fun_trigger(message_like, stripped_text):
             return
         await respond_with_ollama(
@@ -2595,6 +2891,7 @@ async def ensure_speech_listener(
         max_pcm_bytes = int(48000 * 2 * 2 * rolling_window_seconds)
         last_accept_monotonic = 0.0
         last_debug_monotonic = 0.0
+        listener_token = uuid.uuid4().hex
 
         def interrupt_cb(user, data):
             nonlocal last_accept_monotonic, last_debug_monotonic
@@ -2658,6 +2955,7 @@ async def ensure_speech_listener(
             "voice_client": voice_client,
             "guild": guild,
             "text_channel": text_channel,
+            "listener_token": listener_token,
             "busy": False,
             "last_text": "",
             "interrupt_only": True,
@@ -2676,7 +2974,12 @@ async def ensure_speech_listener(
             if exc:
                 logger.exception("Interrupt-listen callback reported an error guild=%s", guild.id, exc_info=exc)
             current = AUTO_LISTEN_SESSIONS.get(guild.id)
-            if current and current.get("voice_client") is voice_client and guild.id not in ACTIVE_RECORDINGS:
+            if (
+                current
+                and current.get("voice_client") is voice_client
+                and current.get("listener_token") == listener_token
+                and guild.id not in ACTIVE_RECORDINGS
+            ):
                 AUTO_LISTEN_SESSIONS.pop(guild.id, None)
 
         voice_client.listen(sink, after=after_interrupt_listen)
@@ -2690,6 +2993,7 @@ async def ensure_speech_listener(
 
     pause_threshold = 0.35 if interrupt_only else get_auto_listen_silence_seconds()
     phrase_limit = 2 if interrupt_only else get_auto_listen_phrase_limit_seconds()
+    listener_token = uuid.uuid4().hex
 
     def process_cb(recognizer, audio, user):
         try:
@@ -2772,6 +3076,7 @@ async def ensure_speech_listener(
         "voice_client": voice_client,
         "guild": guild,
         "text_channel": text_channel,
+        "listener_token": listener_token,
         "busy": False,
         "last_text": "",
         "interrupt_only": interrupt_only,
@@ -2795,7 +3100,12 @@ async def ensure_speech_listener(
                 exc_info=exc,
             )
         current = AUTO_LISTEN_SESSIONS.get(guild.id)
-        if current and current.get("voice_client") is voice_client and guild.id not in ACTIVE_RECORDINGS:
+        if (
+            current
+            and current.get("voice_client") is voice_client
+            and current.get("listener_token") == listener_token
+            and guild.id not in ACTIVE_RECORDINGS
+        ):
             AUTO_LISTEN_SESSIONS.pop(guild.id, None)
 
     voice_client.listen(sink, after=after_auto_listen)
@@ -3126,6 +3436,9 @@ async def on_message(message: discord.Message) -> None:
         content[:200],
     )
 
+    if await maybe_reject_message_during_tts(message, command):
+        return
+
     if command == "!join":
         try:
             voice_client = await ensure_voice_client(message)
@@ -3154,8 +3467,49 @@ async def on_message(message: discord.Message) -> None:
         await handle_clear_command(message, content)
         return
 
+    if command == "!20q":
+        subcommand = parts[1].strip().lower() if len(parts) == 2 else ""
+        if subcommand in {"stop", "end", "quit", "end game"}:
+            if not await stop_twenty_questions(message, message="20 Questions ended."):
+                await message.channel.send("There isn't an active 20 Questions game right now.")
+            return
+        if subcommand == "status":
+            game = ACTIVE_TWENTY_QUESTIONS.get(message.guild.id) if message.guild else None
+            if not game or game.get("channel_id") != message.channel.id:
+                await message.channel.send("There isn't an active 20 Questions game in this channel.")
+                return
+            turns_used = game.get("turns_used", 0)
+            awaiting = game.get("awaiting", "answer")
+            await message.channel.send(
+                f"20 Questions is active. Turn {turns_used}/{TWENTY_QUESTIONS_MAX_TURNS}. Waiting for {'a guess result' if awaiting == 'guess_result' else 'an answer'}."
+            )
+            return
+        await start_twenty_questions(message)
+        return
+
     if command == "!talk" and len(parts) == 1:
         await enable_hands_free_mode(message)
+        return
+
+    if command in {"!endtalk", "!stoptalk", "!talkoff"}:
+        disabled = False
+        if message.guild and stop_auto_listen(message.guild.id, disable=True):
+            disabled = True
+
+        voice_client = get_current_voice_client(message.guild)
+        if voice_client and voice_client.is_connected():
+            if voice_client.is_playing():
+                stop_idle_keepalive(voice_client)
+                if hasattr(voice_client, "stop_playing"):
+                    voice_client.stop_playing()
+                else:
+                    voice_client.stop()
+            start_idle_keepalive(voice_client)
+
+        if disabled:
+            await message.channel.send("Hands-free mode is off.")
+        else:
+            await message.channel.send("Hands-free mode wasn't active.")
         return
 
     if command in {"!record", "!talk"}:
@@ -3186,11 +3540,19 @@ async def on_message(message: discord.Message) -> None:
 
     if command == "!stop":
         stopped_anything = False
+        if message.guild:
+            TTS_BUSY_BYPASS_UNTIL[message.guild.id] = time.monotonic() + 2.0
+            LAST_TTS_BUSY_NOTICE_AT.pop(message.guild.id, None)
+            playback = ACTIVE_TTS_PLAYBACKS.get(message.guild.id)
+            if playback is not None:
+                playback["interrupt_requested"] = True
+                playback["stopped_by_command"] = True
+                ACTIVE_TTS_PLAYBACKS.pop(message.guild.id, None)
 
         if message.guild and stop_active_recording(message.guild.id):
             stopped_anything = True
 
-        if message.guild and stop_auto_listen(message.guild.id, disable=True):
+        if message.guild and stop_auto_listen(message.guild.id, disable=False):
             stopped_anything = True
 
         voice_client = get_current_voice_client(message.guild)
@@ -3206,7 +3568,11 @@ async def on_message(message: discord.Message) -> None:
                     voice_client.stop_playing()
                 else:
                     voice_client.stop()
-            if voice_client.is_connected():
+            if (
+                message.guild
+                and message.guild.id not in AUTO_LISTEN_ENABLED_GUILDS
+                and voice_client.is_connected()
+            ):
                 start_idle_keepalive(voice_client)
             stopped_anything = True
 
@@ -3218,6 +3584,18 @@ async def on_message(message: discord.Message) -> None:
         question = content[4:].strip()
         if not question:
             await message.channel.send("Usage: `!say your message here`")
+            return
+
+        if is_twenty_questions_start_request(question):
+            await start_twenty_questions(message)
+            return
+
+        if is_twenty_questions_end_request(question):
+            if not await stop_twenty_questions(message, message="20 Questions ended."):
+                await message.channel.send("There isn't an active 20 Questions game right now.")
+            return
+
+        if await maybe_handle_twenty_questions_reply(message, question):
             return
 
         if await maybe_handle_fun_trigger(message, question):
@@ -3232,6 +3610,18 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if command.startswith("!"):
+        return
+
+    if is_twenty_questions_start_request(content):
+        await start_twenty_questions(message)
+        return
+
+    if is_twenty_questions_end_request(content):
+        if not await stop_twenty_questions(message, message="20 Questions ended."):
+            await message.channel.send("There isn't an active 20 Questions game right now.")
+        return
+
+    if await maybe_handle_twenty_questions_reply(message, content):
         return
 
     if await maybe_handle_fun_trigger(message, content):
