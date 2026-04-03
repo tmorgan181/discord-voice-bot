@@ -58,6 +58,12 @@ Phase 3 starter adds:
    python dev_runner.py
    ```
 
+   For the full detailed console log stream while debugging:
+
+   ```powershell
+   python dev_runner.py -v
+   ```
+
 ## Voice notes
 
 - `ffmpeg` must be available on your system path.

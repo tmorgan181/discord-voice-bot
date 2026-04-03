@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import time
+import os
 from pathlib import Path
 
 
@@ -31,9 +32,13 @@ def snapshot(root: Path) -> dict[str, int]:
 def main() -> int:
     root = Path(__file__).resolve().parent
     command = [sys.executable, "bot.py"]
+    verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    child_env = os.environ.copy()
+    if verbose:
+        child_env["CHUNG_VERBOSE_LOGS"] = "1"
     previous = snapshot(root)
-    process = subprocess.Popen(command, cwd=root)
-    print("Dev runner started. Watching for file changes...")
+    process = subprocess.Popen(command, cwd=root, env=child_env)
+    print(f"Dev runner started. Watching for file changes... verbose={'on' if verbose else 'off'}")
 
     try:
         while True:
@@ -49,12 +54,12 @@ def main() -> int:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-                process = subprocess.Popen(command, cwd=root)
+                process = subprocess.Popen(command, cwd=root, env=child_env)
 
             if process.poll() is not None:
                 print(f"Bot exited with code {process.returncode}. Restarting in 2 seconds...")
                 time.sleep(2)
-                process = subprocess.Popen(command, cwd=root)
+                process = subprocess.Popen(command, cwd=root, env=child_env)
     except KeyboardInterrupt:
         print("Stopping dev runner...")
         process.terminate()

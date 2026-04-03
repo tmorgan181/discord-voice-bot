@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import sys
 import uuid
 import wave
 from collections import defaultdict
@@ -79,6 +80,16 @@ ACTIVE_CONVERSATIONS: dict[int, dict] = {}
 AUTO_LISTEN_SESSIONS: dict[int, dict] = {}
 AUTO_LISTEN_ENABLED_GUILDS: set[int] = set()
 ACTIVE_TTS_PLAYBACKS: dict[int, dict] = {}
+PENDING_VOICE_EXIT_TASKS: dict[int, asyncio.Task] = {}
+
+COLOR_RESET = "\033[0m"
+COLOR_DIM = "\033[2m"
+COLOR_RED = "\033[31m"
+COLOR_GREEN = "\033[32m"
+COLOR_YELLOW = "\033[33m"
+COLOR_BLUE = "\033[34m"
+COLOR_MAGENTA = "\033[35m"
+COLOR_CYAN = "\033[36m"
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -208,11 +219,101 @@ def resolve_conversation_log_path() -> Path:
     return DEFAULT_CONVERSATION_LOG_DIR / f"conversation-{SESSION_TIMESTAMP}.json"
 
 
+def verbose_logging_enabled() -> bool:
+    return env_flag("CHUNG_VERBOSE_LOGS", False) or "-v" in sys.argv or "--verbose" in sys.argv
+
+
+class EssentialConsoleFilter(logging.Filter):
+    SUPPRESSED_PREFIXES = (
+        "Ensuring voice client",
+        "Voice connect attempt",
+        "Reusing existing voice connection",
+        "Preparing TTS playback",
+        "Generated TTS audio",
+        "Stopping silent keepalive playback",
+        "Started silent keepalive playback",
+        "Reset conversation history",
+        "Created conversation log",
+        "Confirmed listener shutdown before TTS",
+        "Rejected auto-listen audio chunk",
+        "Started voice health monitor task",
+        "Voice health guild=",
+        "Added control reaction",
+        "Removed control reaction",
+        "Patched voice receive decoder",
+        "Phase 3 dependencies ready",
+        "Voice backend ready",
+        "Runtime logging initialized",
+    )
+
+    def __init__(self, verbose: bool):
+        super().__init__()
+        self.verbose = verbose
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.verbose:
+            return True
+        if record.name != "chung":
+            return False
+        if record.levelno >= logging.WARNING:
+            return True
+        message = record.getMessage()
+        return not any(message.startswith(prefix) for prefix in self.SUPPRESSED_PREFIXES)
+
+
+class ConsoleFormatter(logging.Formatter):
+    def __init__(self, verbose: bool):
+        super().__init__()
+        self.verbose = verbose
+
+    def format(self, record: logging.LogRecord) -> str:
+        if self.verbose:
+            return f"{record.asctime if hasattr(record, 'asctime') else ''}{record.getMessage()}"
+
+        message = record.getMessage()
+        if record.levelno >= logging.ERROR:
+            return f"{COLOR_RED}[ERROR]{COLOR_RESET} {message}"
+        if record.levelno >= logging.WARNING:
+            return f"{COLOR_YELLOW}[WARN]{COLOR_RESET} {message}"
+
+        if record.name != "chung":
+            return f"{COLOR_DIM}{message}{COLOR_RESET}"
+
+        tag = "INFO"
+        color = COLOR_CYAN
+        if message.startswith("Logged in as"):
+            tag, color = "READY", COLOR_GREEN
+        elif message.startswith("Received message"):
+            tag, color = "CMD", COLOR_BLUE
+        elif message.startswith("Started auto-listen"):
+            tag, color = "LISTEN", COLOR_GREEN
+        elif message.startswith("Hands-free ready again"):
+            tag, color = "LISTEN", COLOR_GREEN
+        elif message.startswith("Auto-listen text"):
+            tag, color = "HEARD", COLOR_CYAN
+            parts = message.split(" text=", 1)
+            if len(parts) == 2:
+                message = parts[1]
+        elif message.startswith("Ollama answered successfully"):
+            tag, color = "THINK", COLOR_MAGENTA
+        elif message.startswith("Started voice playback"):
+            tag, color = "SPEAK", COLOR_MAGENTA
+        elif message.startswith("Stop requested"):
+            tag, color = "STOP", COLOR_YELLOW
+        elif message.startswith("Disconnected from voice"):
+            tag, color = "LEAVE", COLOR_YELLOW
+        elif message.startswith("Connecting to voice channel"):
+            tag, color = "JOIN", COLOR_GREEN
+
+        return f"{color}[{tag}]{COLOR_RESET} {message}"
+
+
 def setup_logging() -> logging.Logger:
     global SESSION_RUNTIME_LOG_PATH
     log_path = resolve_runtime_log_path()
     SESSION_RUNTIME_LOG_PATH = log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    verbose = verbose_logging_enabled()
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -227,15 +328,31 @@ def setup_logging() -> logging.Logger:
     file_handler.setFormatter(formatter)
 
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
+    if verbose:
+        stream_handler.setFormatter(formatter)
+    else:
+        stream_handler.setFormatter(ConsoleFormatter(verbose=False))
+    stream_handler.addFilter(EssentialConsoleFilter(verbose=verbose))
 
     root_logger.addHandler(file_handler)
     root_logger.addHandler(stream_handler)
 
-    discord.utils.setup_logging(level=logging.INFO, root=False)
+    discord.utils.setup_logging(level=logging.INFO if verbose else logging.WARNING, root=False)
+
+    # Keep the runtime log focused on the bot lifecycle instead of library chatter.
+    logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR if not verbose else logging.INFO)
+    logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR if not verbose else logging.WARNING)
+    logging.getLogger("discord.player").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("faster_whisper").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("comtypes").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("discord.client").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("discord.gateway").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("discord.voice_state").setLevel(logging.WARNING if not verbose else logging.INFO)
 
     logger = logging.getLogger("chung")
-    logger.info("Runtime logging initialized at %s", log_path)
+    logger.info("Runtime logging initialized at %s (verbose=%s)", log_path, verbose)
     return logger
 
 
@@ -1272,6 +1389,30 @@ async def reset_voice_client(guild: discord.Guild | None) -> None:
             logger.exception("Failed to disconnect stale voice client for guild %s", guild.id)
 
 
+async def finalize_voice_exit_if_still_disconnected(guild: discord.Guild, expected_before_channel_id: int | None) -> None:
+    try:
+        await asyncio.sleep(1.0)
+        bot_voice_channel = await fetch_bot_voice_channel(guild)
+        if bot_voice_channel is not None:
+            logger.info(
+                "Ignoring transient voice exit for guild=%s expected_before_channel=%s current_channel=%s",
+                guild.id,
+                expected_before_channel_id,
+                bot_voice_channel.id,
+            )
+            return
+        logger.info(
+            "Confirmed bot voice exit guild=%s expected_before_channel=%s; clearing session state",
+            guild.id,
+            expected_before_channel_id,
+        )
+        stop_auto_listen(guild.id, disable=True)
+        clear_conversation_history(guild.id)
+        await remove_control_message_reaction_for_guild(guild)
+    finally:
+        PENDING_VOICE_EXIT_TASKS.pop(guild.id, None)
+
+
 def get_bot_voice_channel(guild: discord.Guild | None) -> discord.abc.GuildChannel | None:
     if guild is None or client.user is None:
         return None
@@ -1417,6 +1558,12 @@ def is_idle_keepalive_active(voice_client: discord.VoiceClient | None) -> bool:
 def start_idle_keepalive(voice_client: discord.VoiceClient) -> None:
     if not voice_client.is_connected():
         logger.info("Skipping idle keepalive because voice client is not connected")
+        return
+    if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
+        logger.info(
+            "Skipping idle keepalive because voice receive is active in channel %s",
+            voice_client.channel.id if voice_client.channel else None,
+        )
         return
     if voice_client.is_playing():
         logger.info(
@@ -1697,46 +1844,30 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
         voice_state_snapshot(voice_client),
     )
     audio_path = await asyncio.to_thread(synthesize_tts_to_file, text)
-    if guild_id is not None:
-        ACTIVE_TTS_PLAYBACKS[guild_id] = {
-            "voice_client": voice_client,
-            "interrupt_requested": False,
-        }
 
     def cleanup(error: Exception | None) -> None:
-        playback_state = ACTIVE_TTS_PLAYBACKS.pop(guild_id, None) if guild_id is not None else None
         if error:
             logger.exception("Voice playback error", exc_info=error)
         setattr(voice_client, "_idle_keepalive_active", False)
         try:
             audio_path.unlink(missing_ok=True)
+        except PermissionError:
+            logger.warning("Temporary TTS file still in use during cleanup: %s", audio_path)
         except OSError:
-            logger.exception("Could not delete temporary audio file %s", audio_path)
-        interrupted = bool(playback_state and playback_state.get("interrupt_requested"))
+            logger.warning("Could not delete temporary audio file %s", audio_path)
         fallback_channel = None
         if guild is not None:
             session = AUTO_LISTEN_SESSIONS.get(guild.id)
             fallback_channel = session.get("text_channel") if session else None
             if session and session.get("interrupt_only"):
-                if not session.get("capture_active"):
-                    stop_auto_listen(guild.id)
-                else:
-                    logger.info("Keeping interrupt-listen active after playback stop guild=%s for capture finalization", guild.id)
+                stop_auto_listen(guild.id)
         if voice_client.is_connected():
             if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
                 try:
-                    if interrupted and session and session.get("capture_active"):
-                        pass
-                    elif interrupted:
-                        asyncio.run_coroutine_threadsafe(
-                            resume_hands_free_after_playback(guild, fallback_channel),
-                            client.loop,
-                        )
-                    else:
-                        asyncio.run_coroutine_threadsafe(
-                            resume_hands_free_after_playback(guild, fallback_channel),
-                            client.loop,
-                        )
+                    asyncio.run_coroutine_threadsafe(
+                        resume_hands_free_after_playback(guild, fallback_channel),
+                        client.loop,
+                    )
                 except Exception:
                     logger.exception("Failed to resume auto-listen after TTS playback")
             else:
@@ -1746,10 +1877,14 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
                     logger.exception("Failed to restart idle keepalive after TTS playback")
 
     if guild_id is not None:
-        stop_auto_listen(guild_id)
-        if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
-            logger.info("Attempting to start interrupt-listen for guild=%s before TTS playback", guild.id)
-            await ensure_interrupt_listen(guild)
+        stopped_listener = stop_auto_listen(guild_id)
+        if stopped_listener and isinstance(voice_client, voice_recv.VoiceRecvClient):
+            listener_stopped = await wait_for_voice_listener_stop(voice_client)
+            logger.info(
+                "Confirmed listener shutdown before TTS guild=%s stopped=%s",
+                guild_id,
+                listener_stopped,
+            )
     if voice_client.is_playing():
         stop_idle_keepalive(voice_client)
 
@@ -1993,11 +2128,23 @@ async def resume_hands_free_after_playback(guild: discord.Guild, fallback_channe
     await asyncio.sleep(0.05)
     await ensure_auto_listen(guild, fallback_channel)
     voice_client = get_current_voice_client(guild)
-    if voice_client and voice_client.is_connected() and not voice_client.is_playing():
+    if (
+        voice_client
+        and voice_client.is_connected()
+        and not voice_client.is_playing()
+        and not (isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening())
+    ):
         try:
             start_idle_keepalive(voice_client)
         except Exception:
             logger.exception("Failed to restart idle keepalive after resuming hands-free mode")
+    logger.info(
+        "Hands-free ready again guild=%s listening=%s playing=%s idle_keepalive=%s",
+        guild.id,
+        isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening() if voice_client else False,
+        voice_client.is_playing() if voice_client else False,
+        is_idle_keepalive_active(voice_client),
+    )
 
 
 async def resume_hands_free_if_enabled(guild: discord.Guild, fallback_channel=None) -> None:
@@ -2630,10 +2777,16 @@ async def on_voice_state_update(
         after.self_mute,
         after.self_deaf,
     )
+    pending_exit = PENDING_VOICE_EXIT_TASKS.pop(member.guild.id, None)
+    if pending_exit is not None:
+        pending_exit.cancel()
     if after.channel is None:
-        stop_auto_listen(member.guild.id, disable=True)
-        clear_conversation_history(member.guild.id)
-        await remove_control_message_reaction_for_guild(member.guild)
+        PENDING_VOICE_EXIT_TASKS[member.guild.id] = asyncio.create_task(
+            finalize_voice_exit_if_still_disconnected(
+                member.guild,
+                before.channel.id if before.channel else None,
+            )
+        )
 
 
 @client.event
@@ -2731,7 +2884,10 @@ async def on_message(message: discord.Message) -> None:
             )
             stop_idle_keepalive(voice_client)
             if voice_client.is_playing():
-                voice_client.stop()
+                if hasattr(voice_client, "stop_playing"):
+                    voice_client.stop_playing()
+                else:
+                    voice_client.stop()
             if voice_client.is_connected():
                 start_idle_keepalive(voice_client)
             stopped_anything = True
