@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sys
 import uuid
@@ -1337,14 +1338,17 @@ async def send_fun_response(
 
     guild = getattr(context, "guild", None)
     author = getattr(context, "author", None)
-    has_active_voice = guild is not None and get_current_voice_client(guild) is not None
+    current_voice_client = get_current_voice_client(guild) if guild is not None else None
+    has_active_voice = current_voice_client is not None
     has_configured_voice = bool(get_env_value("BOT_VOICE_CHANNEL_ID"))
     author_in_voice = isinstance(author, discord.Member) and author.voice is not None
     if not (has_active_voice or has_configured_voice or author_in_voice):
         return
 
     try:
-        voice_client = await ensure_voice_client(context)
+        voice_client = current_voice_client
+        if voice_client is None or not voice_client.is_connected():
+            voice_client = await ensure_voice_client(context)
         if voice_client is not None:
             await speak_text(voice_client, spoken)
     except discord.ClientException:
@@ -1354,21 +1358,57 @@ async def send_fun_response(
 
 
 def build_enhance_text(content: str) -> str:
-    lowered = content.lower()
-    match = re.search(r"\benhance\b[:\s,-]*(.*)", content, flags=re.IGNORECASE)
-    subject = match.group(1).strip() if match else ""
-    if not subject:
-        if "pixel" in lowered:
-            subject = "the suspicious pixel"
-        elif "mystery" in lowered:
-            subject = "the mystery blob"
-        else:
-            subject = "the blurry evidence"
+    del content
+
+    subject = random.choice(
+        [
+            "the suspicious pixel",
+            "the blurry evidence",
+            "the mystery blob",
+            "one deeply unhelpful shadow",
+            "the least trustworthy jpeg in the room",
+            "an emotionally compromised screenshot",
+            "the crunchy artifact near the crime scene",
+            "whatever that glowing smudge is",
+        ]
+    )
+
+    first_percent = random.randint(18, 74)
+    second_percent = random.randint(7, 41)
+    first_quality = random.choice(
+        [
+            "dramatic",
+            "suspicious",
+            "cinematic",
+            "concerning",
+            "forensically spicy",
+            "unnecessarily intense",
+        ]
+    )
+    second_quality = random.choice(
+        [
+            "legally questionable",
+            "haunted",
+            "goblin-adjacent",
+            "overengineered",
+            "deeply cursed",
+            "evidence-shaped",
+        ]
+    )
+    ending = random.choice(
+        [
+            "and somehow still blurry.",
+            "yet remains spiritually low-resolution.",
+            "and absolutely not admissible anywhere.",
+            "but the vibes are now significantly worse.",
+            "and the pixel has learned nothing.",
+        ]
+    )
 
     return (
         "ENHANCING...\n"
         f"Target: `{subject[:80]}`\n"
-        "Result: 37% more dramatic, 12% more legally questionable, and somehow still blurry."
+        f"Result: {first_percent}% more {first_quality}, {second_percent}% more {second_quality}, {ending}"
     )
 
 
@@ -1408,13 +1448,23 @@ def build_roll_credits_text(context) -> str:
         "Assistant to the Chaos Director",
         "Whee Compliance Auditor",
     ]
+    taglines = [
+        "No budgets were harmed in the making of this session.",
+        "Filmed before a live studio goblin.",
+        "All stunts performed by emotionally underqualified professionals.",
+        "No one was prepared, least of all the narrator.",
+        "Respect was paid. Repeatedly.",
+        "Any resemblance to competent planning is purely coincidental.",
+    ]
     cast = resolve_credits_cast(context)
+    randomized_roles = roles[:]
+    random.shuffle(randomized_roles)
     credit_lines = ["## Roll Credits", ""]
     for index, name in enumerate(cast):
-        role = roles[index % len(roles)]
+        role = randomized_roles[index % len(randomized_roles)]
         credit_lines.append(f"{name} as {role}")
     credit_lines.append("")
-    credit_lines.append("No budgets were harmed in the making of this session.")
+    credit_lines.append(random.choice(taglines))
     return "\n".join(credit_lines)
 
 
@@ -1422,11 +1472,11 @@ def matches_fun_trigger(content: str) -> bool:
     lowered = content.strip().lower()
     return any(
         (
-            "do a barrel roll" in lowered,
-            bool(re.search(r"\bpress\s+f\b", lowered)),
-            bool(re.search(r"\bbonk\b", lowered)),
-            bool(re.search(r"\benhance\b", lowered)),
-            "roll credits" in lowered,
+            bool(re.search(r"\bbarrel\b", lowered)),
+            bool(re.search(r"\b(?:press\s+f|f)\b", lowered)),
+            bool(re.search(r"\b(?:bonk|vonk|wonk)\b", lowered)),
+            bool(re.search(r"\benhance(d)?\b", lowered)),
+            "roll credits" in lowered or "roll credit" in lowered or bool(re.search(r"\bcredits?\b", lowered)),
         )
     )
 
@@ -1440,7 +1490,7 @@ def resolve_bonk_target(context, content: str):
         target = mentions[0]
         return getattr(target, "id", None), getattr(target, "display_name", str(target))
 
-    match = re.search(r"\bbonk\b[\s,:-]*(.+)", content, flags=re.IGNORECASE)
+    match = re.search(r"\b(?:bonk|vonk|wonk)\b[\s,:-]*(.+)", content, flags=re.IGNORECASE)
     if not match:
         return getattr(author, "id", None), getattr(author, "display_name", str(author) if author else "someone")
 
@@ -1506,15 +1556,15 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
     lowered = stripped.lower()
     author = getattr(context, "author", None)
 
-    if "do a barrel roll" in lowered:
+    if re.search(r"\bbarrel\b", lowered):
         await send_fun_response(
             context,
             f"```text\n{BARREL_ROLL_ASCII}\n```\nwheeeee",
-            speak_text_reply="wheeeee",
+            speak_text_reply="Wheeeee eee eee eee.",
         )
         return True
 
-    if re.search(r"\bpress\s+f\b", lowered):
+    if re.search(r"\b(?:press\s+f|f)\b", lowered):
         await send_fun_response(
             context,
             f"```text\n{PRESS_F_ASCII}\n```\nrespect has been paid",
@@ -1522,7 +1572,7 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
         )
         return True
 
-    if re.search(r"\bbonk\b", lowered):
+    if re.search(r"\b(?:bonk|vonk|wonk)\b", lowered):
         target_id, target_name = resolve_bonk_target(context, stripped)
         if target_id is not None:
             BONK_COUNTS[target_id] += 1
@@ -1537,7 +1587,7 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
         )
         return True
 
-    if re.search(r"\benhance\b", lowered):
+    if re.search(r"\benhance(d)?\b", lowered):
         await send_fun_response(
             context,
             build_enhance_text(stripped),
@@ -1545,7 +1595,7 @@ async def maybe_handle_fun_trigger(context, content: str) -> bool:
         )
         return True
 
-    if "roll credits" in lowered:
+    if "roll credits" in lowered or "roll credit" in lowered or re.search(r"\bcredits?\b", lowered):
         credits_text = build_roll_credits_text(context)
         await send_fun_response(
             context,
@@ -2364,7 +2414,6 @@ async def process_auto_transcript(
         await channel.send(f"Heard {getattr(user, 'display_name', user)}: {stripped_text}")
         message_like = SimpleNamespace(guild=guild, channel=channel, author=user)
         if await maybe_handle_fun_trigger(message_like, stripped_text):
-            await resume_if_needed()
             return
         await respond_with_ollama(
             message_like,
