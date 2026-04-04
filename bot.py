@@ -88,6 +88,7 @@ BONK_COUNTS: dict[int, int] = defaultdict(int)
 ACTIVE_TWENTY_QUESTIONS: dict[int, dict] = {}
 LAST_TTS_BUSY_NOTICE_AT: dict[int, float] = {}
 TTS_BUSY_BYPASS_UNTIL: dict[int, float] = {}
+LAST_PACKET_WARNING_AT: dict[tuple[str, int | None], float] = {}
 
 COLOR_RESET = "\033[0m"
 COLOR_DIM = "\033[2m"
@@ -371,7 +372,9 @@ def setup_logging() -> logging.Logger:
     discord.utils.setup_logging(level=logging.INFO if verbose else logging.WARNING, root=False)
 
     # Keep the runtime log focused on the bot lifecycle instead of library chatter.
-    logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR if not verbose else logging.INFO)
+    reader_logger = logging.getLogger("discord.ext.voice_recv.reader")
+    reader_logger.setLevel(logging.CRITICAL if not verbose else logging.INFO)
+    reader_logger.disabled = not verbose
     logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING if not verbose else logging.INFO)
     logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR if not verbose else logging.WARNING)
     logging.getLogger("discord.player").setLevel(logging.WARNING if not verbose else logging.INFO)
@@ -403,12 +406,23 @@ def log_phase3_backend_status() -> None:
     )
 
 
+def should_log_packet_warning(kind: str, ssrc: int | None, *, interval_seconds: float = 10.0) -> bool:
+    now = time.monotonic()
+    key = (kind, ssrc)
+    last_logged = LAST_PACKET_WARNING_AT.get(key, 0.0)
+    if now - last_logged < interval_seconds:
+        return False
+    LAST_PACKET_WARNING_AT[key] = now
+    return True
+
+
 def patch_voice_recv_decoder() -> None:
     global VOICE_RECV_PATCHED
     if VOICE_RECV_PATCHED:
         return
 
     original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
+    original_process_packet = voice_recv_opus.PacketDecoder._process_packet
     silence_frame = b"\x00" * voice_recv_opus.Decoder.SAMPLE_SIZE * voice_recv_opus.Decoder.SAMPLES_PER_FRAME
 
     def safe_decode_packet(self, packet):
@@ -418,7 +432,7 @@ def patch_voice_recv_decoder() -> None:
             ssrc = getattr(packet, "ssrc", None)
             if ssrc in ACTIVE_RECORDING_SSRCS:
                 CORRUPT_PACKET_COUNTS[ssrc] = CORRUPT_PACKET_COUNTS.get(ssrc, 0) + 1
-            else:
+            elif should_log_packet_warning("opus", ssrc):
                 logger.warning(
                     "Ignoring corrupt Opus packet outside active recording ssrc=%s sequence=%s error=%s",
                     ssrc,
@@ -427,9 +441,30 @@ def patch_voice_recv_decoder() -> None:
                 )
             return packet, silence_frame
 
+    def safe_process_packet(self, packet):
+        try:
+            return original_process_packet(self, packet)
+        except ValueError as exc:
+            if "Failed to decrypt" not in str(exc):
+                raise
+            ssrc = getattr(packet, "ssrc", None)
+            if should_log_packet_warning("decrypt", ssrc):
+                logger.warning(
+                    "Dropping undecryptable voice packet ssrc=%s sequence=%s timestamp=%s error=%s",
+                    ssrc,
+                    getattr(packet, "sequence", None),
+                    getattr(packet, "timestamp", None),
+                    exc,
+                )
+            if packet:
+                self._last_seq = packet.sequence
+                self._last_ts = packet.timestamp
+            return None
+
     voice_recv_opus.PacketDecoder._decode_packet = safe_decode_packet
+    voice_recv_opus.PacketDecoder._process_packet = safe_process_packet
     VOICE_RECV_PATCHED = True
-    logger.info("Patched voice receive decoder to tolerate corrupt Opus packets")
+    logger.info("Patched voice receive decoder to tolerate corrupt Opus packets and decrypt failures")
 
 
 def ask_ollama(prompt: str) -> str:
@@ -653,7 +688,7 @@ def is_twenty_questions_end_request(text: str) -> bool:
     lowered = text.strip().lower()
     return bool(
         re.search(
-            r"\b(?:"
+            r"\b(?:" 
             r"end(?:\s+of)?\s+(?:the\s+)?(?:game|again)"
             r"|and\s+(?:the\s+)?game"
             r"|stop\s+(?:the\s+)?game"
@@ -662,6 +697,18 @@ def is_twenty_questions_end_request(text: str) -> bool:
             lowered,
         )
     )
+
+
+def is_twenty_questions_stop_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    return lowered in {
+        "!20q stop",
+        "!20q end",
+        "!20q quit",
+        "!stop",
+        "!endgame",
+        "!stopgame",
+    }
 
 
 async def advance_twenty_questions_turn(context, game: dict) -> None:
@@ -741,7 +788,7 @@ async def maybe_handle_twenty_questions_reply(context, content: str) -> bool:
         return True
 
     lowered = stripped.lower()
-    if lowered in {"!20q stop", "!20q end", "!20q quit"} or is_twenty_questions_end_request(lowered):
+    if is_twenty_questions_stop_command(lowered) or is_twenty_questions_end_request(lowered):
         await stop_twenty_questions(context, message="20 Questions ended.")
         return True
 
@@ -1079,7 +1126,6 @@ async def handle_record_or_talk(
         speak_reply=True,
         log_source="voice",
     )
-    await ensure_auto_listen(context.guild, context.channel)
 
 
 def synthesize_tts_to_file(text: str) -> Path:
@@ -2862,6 +2908,13 @@ async def ensure_speech_listener(
             guild.id,
         )
         return
+    if guild.id in ACTIVE_TTS_PLAYBACKS:
+        logger.info(
+            "Skipping %s for guild=%s because TTS playback is still active",
+            "interrupt-listen" if interrupt_only else "auto-listen",
+            guild.id,
+        )
+        return
 
     existing = AUTO_LISTEN_SESSIONS.get(guild.id)
     if (
@@ -3489,6 +3542,11 @@ async def on_message(message: discord.Message) -> None:
         await start_twenty_questions(message)
         return
 
+    if command in {"!endgame", "!stopgame"}:
+        if not await stop_twenty_questions(message, message="20 Questions ended."):
+            await message.channel.send("There isn't an active 20 Questions game right now.")
+        return
+
     if command == "!talk" and len(parts) == 1:
         await enable_hands_free_mode(message)
         return
@@ -3542,6 +3600,8 @@ async def on_message(message: discord.Message) -> None:
 
     if command == "!stop":
         stopped_anything = False
+        if await stop_twenty_questions(message, message="20 Questions ended."):
+            stopped_anything = True
         if message.guild:
             TTS_BUSY_BYPASS_UNTIL[message.guild.id] = time.monotonic() + 2.0
             LAST_TTS_BUSY_NOTICE_AT.pop(message.guild.id, None)
