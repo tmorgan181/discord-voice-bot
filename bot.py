@@ -2510,6 +2510,8 @@ async def remove_control_message_reaction_for_guild(guild: discord.Guild) -> Non
 async def resolve_text_channel_for_guild(
     guild: discord.Guild, fallback_channel: discord.abc.Messageable | None = None
 ):
+    if fallback_channel is not None:
+        return fallback_channel
     if text_channel_id:
         channel = client.get_channel(text_channel_id)
         if channel is None:
@@ -2520,7 +2522,7 @@ async def resolve_text_channel_for_guild(
                 channel = None
         if channel is not None:
             return channel
-    return fallback_channel
+    return None
 
 
 def stop_auto_listen(guild_id: int, *, disable: bool = False) -> bool:
@@ -3183,7 +3185,7 @@ async def on_message(message: discord.Message) -> None:
     if message.author == client.user:
         return
 
-    if text_channel_id is not None and message.channel.id != text_channel_id:
+    if not isinstance(message.channel, discord.abc.Messageable):
         return
 
     content = message.content.strip()
