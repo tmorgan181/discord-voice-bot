@@ -2318,23 +2318,31 @@ async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvC
         await send_error(message.channel, "Voice features only work inside a server.")
         return None
 
-    configured_voice_channel_id = get_env_value("BOT_VOICE_CHANNEL_ID")
     target_channel: discord.VoiceChannel | None = None
 
-    if configured_voice_channel_id:
-        channel = message.guild.get_channel(int(configured_voice_channel_id))
-        if not isinstance(channel, discord.VoiceChannel):
-            await send_error(
-                message.channel,
-                "The configured `BOT_VOICE_CHANNEL_ID` is missing or is not a voice channel.",
-            )
-            return None
-        target_channel = channel
-    else:
-        if not isinstance(message.author, discord.Member) or not message.author.voice:
-            await send_error(message.channel, "Join a voice channel first, then try again.")
-            return None
+    if isinstance(message.author, discord.Member) and message.author.voice:
         target_channel = message.author.voice.channel
+
+    if target_channel is None:
+        configured_voice_channel_id = get_env_value("BOT_VOICE_CHANNEL_ID")
+        if configured_voice_channel_id:
+            channel = message.guild.get_channel(int(configured_voice_channel_id))
+            if channel is None:
+                try:
+                    channel = await client.fetch_channel(int(configured_voice_channel_id))
+                except Exception:
+                    logger.exception("Could not fetch configured voice channel id=%s", configured_voice_channel_id)
+            if not isinstance(channel, discord.VoiceChannel):
+                await send_error(
+                    message.channel,
+                    "The configured `BOT_VOICE_CHANNEL_ID` is not a valid voice channel.",
+                )
+                return None
+            target_channel = channel
+
+    if target_channel is None:
+        await send_error(message.channel, "Join a voice channel first, then try again.")
+        return None
 
     logger.info(
         "Ensuring voice client for guild=%s channel=%s user=%s",
