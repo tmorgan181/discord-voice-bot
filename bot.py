@@ -144,6 +144,23 @@ def get_env_value(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def get_env_csv_ints(*names: str) -> list[int]:
+    raw_value = get_env_value(*names)
+    if not raw_value:
+        return []
+
+    values: list[int] = []
+    for part in raw_value.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        try:
+            values.append(int(cleaned))
+        except ValueError:
+            logger.warning("Ignoring invalid channel id in %s: %s", ", ".join(names), cleaned)
+    return values
+
+
 def get_history_max_turns() -> int:
     raw_value = get_env_value("BOT_HISTORY_MAX_TURNS", default="12")
     try:
@@ -1030,7 +1047,7 @@ async def respond_with_ollama(
     try:
         voice_client = await ensure_voice_client(message)
         if voice_client is not None:
-            await speak_text(voice_client, answer)
+            await speak_text(voice_client, answer, fallback_channel=message.channel)
     except discord.ClientException:
         logger.exception("Discord voice error after text reply")
         await send_error(
@@ -2355,7 +2372,12 @@ async def ensure_voice_client(message: discord.Message) -> voice_recv.VoiceRecvC
     return voice_client
 
 
-async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
+async def speak_text(
+    voice_client: discord.VoiceClient,
+    text: str,
+    *,
+    fallback_channel: discord.abc.Messageable | None = None,
+) -> None:
     guild = getattr(voice_client, "guild", None)
     guild_id = guild.id if guild else None
     logger.info(
@@ -2379,15 +2401,16 @@ async def speak_text(voice_client: discord.VoiceClient, text: str) -> None:
             logger.warning("Temporary TTS file still in use during cleanup: %s", audio_path)
         except OSError:
             logger.warning("Could not delete temporary audio file %s", audio_path)
-        fallback_channel = None
+        resume_channel = fallback_channel
         if guild is not None:
             session = AUTO_LISTEN_SESSIONS.get(guild.id)
-            fallback_channel = session.get("text_channel") if session else None
+            if resume_channel is None:
+                resume_channel = session.get("text_channel") if session else None
         if voice_client.is_connected():
             if guild is not None and guild.id in AUTO_LISTEN_ENABLED_GUILDS:
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        resume_hands_free_after_playback(guild, fallback_channel),
+                        resume_hands_free_after_playback(guild, resume_channel),
                         client.loop,
                     )
                 except Exception:
@@ -3105,6 +3128,12 @@ token = get_required_env("DISCORD_BOT_TOKEN", "DISCORD_ECHO_TOKEN")
 text_channel_id = get_env_value("BOT_TEXT_CHANNEL_ID", "BOT_ALLOWED_CHANNEL_ID", "ECHO_CHAMBER_CHANNEL_ID")
 if text_channel_id:
     text_channel_id = int(text_channel_id)
+allowed_text_channel_ids = set(
+    get_env_csv_ints("BOT_ALLOWED_CHANNEL_IDS", "BOT_TEXT_CHANNEL_IDS")
+)
+if text_channel_id:
+    allowed_text_channel_ids.add(text_channel_id)
+allowed_text_channel_ids.add(815805607823147011)
 reaction_control_message_id = get_env_value("BOT_REACTION_MESSAGE_ID")
 if reaction_control_message_id:
     reaction_control_message_id = int(reaction_control_message_id)
@@ -3194,6 +3223,12 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if not isinstance(message.channel, discord.abc.Messageable):
+        return
+    if (
+        message.guild is not None
+        and allowed_text_channel_ids
+        and message.channel.id not in allowed_text_channel_ids
+    ):
         return
 
     content = message.content.strip()
