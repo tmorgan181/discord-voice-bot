@@ -3312,13 +3312,21 @@ async def on_message(message: discord.Message) -> None:
             stopped_anything = True
         if message.guild:
             LAST_TTS_BUSY_NOTICE_AT.pop(message.guild.id, None)
+            was_tts_playing = message.guild.id in ACTIVE_TTS_PLAYBACKS
             ACTIVE_TTS_PLAYBACKS.pop(message.guild.id, None)
 
         if message.guild and stop_active_recording(message.guild.id):
             stopped_anything = True
 
-        if message.guild and stop_auto_listen(message.guild.id, disable=False):
-            stopped_anything = True
+        if message.guild:
+            if was_tts_playing:
+                stop_auto_listen(message.guild.id, disable=False)
+            else:
+                was_hands_free = message.guild.id in AUTO_LISTEN_ENABLED_GUILDS
+                if stop_auto_listen(message.guild.id, disable=True):
+                    stopped_anything = True
+                if was_hands_free:
+                    await message.channel.send("Hands-free mode is off.")
 
         voice_client = get_current_voice_client(message.guild)
         if voice_client and voice_client.is_playing():
